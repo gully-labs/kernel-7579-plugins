@@ -66,8 +66,8 @@ contract DefaultSecurityHookBlockedSelectorHalmos is SymTest {
     /// @dev Build preCheck msgData for a CALLTYPE_SINGLE call (mode word all-zero => callType 0x00),
     ///      packed executionData = target(20) || value(32) || selector(4) = 0x38 bytes > 0x33, so
     ///      LibERC7579.decodeSingle succeeds. preCheck reads the inner `msgData` param as: [0:4]
-    ///      dummy selector, [4:36] mode, [36:68] ABI offset for the executionData bytes, then
-    ///      length + data — hence dummy-selector || abi.encode(mode, executionData).
+    ///      execute selector, [4:36] mode, [36:68] ABI offset for the executionData bytes, then
+    ///      length + data.
     function _buildSingleMsgData(address target, uint256 value, bytes4 selector)
         internal
         view
@@ -75,7 +75,7 @@ contract DefaultSecurityHookBlockedSelectorHalmos is SymTest {
     {
         bytes32 mode = bytes32(0); // high byte == 0x00 => CALLTYPE_SINGLE
         bytes memory executionData = abi.encodePacked(target, value, selector);
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
     }
 
