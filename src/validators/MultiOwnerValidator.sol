@@ -23,8 +23,18 @@ import {
 ///      Install data is `abi.encode(OwnerConfig[])`. Signatures are encoded as
 ///      `abi.encodePacked(ownerId, ownerSignature)`. The selected stateless validator defines both
 ///      `ownerSignature` and `validationData`.
+///
+///      Owner records use account-associated storage slots for ERC-7562 validation, and validation
+///      reconstructs the configured data in memory. The aggregate validation data for one account is
+///      capped at 4096 bytes so owner cleanup remains bounded.
+///
+///      `isModuleType(MODULE_TYPE_STATELESS_VALIDATOR)` is the only standardized capability signal.
+///      It cannot prove that arbitrary validation data or signatures are usable. Integrations should
+///      validate each owner configuration off-chain and retain a separately tested recovery authority.
 contract MultiOwnerValidator is IValidator {
     uint256 public constant MAX_OWNERS = 32;
+    uint256 public constant MAX_TOTAL_VALIDATION_DATA = 4096;
+    uint256 internal constant MAX_VALIDATION_DATA_WORDS = MAX_TOTAL_VALIDATION_DATA / 32;
 
     struct OwnerConfig {
         bytes32 ownerId;
@@ -34,13 +44,18 @@ contract MultiOwnerValidator is IValidator {
 
     struct Owner {
         address statelessValidator;
-        bytes validationData;
+        uint16 validationDataLength;
+        bytes32[MAX_VALIDATION_DATA_WORDS] validationDataWords;
     }
 
-    mapping(address account => mapping(bytes32 ownerId => Owner)) internal _owners;
+    // ownerId is the outer key so each inner owner record starts at
+    // keccak256(abi.encode(account, keccak256(abi.encode(ownerId, slot)))). The header and
+    // fixed-size data words therefore occupy account-associated slots base + [0, 128].
+    mapping(bytes32 ownerId => mapping(address account => Owner)) internal _owners;
 
     mapping(address account => bytes32[]) internal _ownerIds;
     mapping(address account => mapping(bytes32 ownerId => uint256 indexPlusOne)) internal _ownerIndex;
+    mapping(address account => uint256 length) internal _totalValidationData;
 
     event OwnerAdded(
         address indexed account, bytes32 indexed ownerId, address indexed statelessValidator, bytes validationData
@@ -57,6 +72,7 @@ contract MultiOwnerValidator is IValidator {
     error OwnerDoesNotExist(bytes32 ownerId);
     error MaxOwnersExceeded();
     error CannotRemoveLastOwner();
+    error ValidationDataLimitExceeded(uint256 attempted, uint256 maximum);
 
     function onInstall(bytes calldata data) external payable override {
         require(!_isInitialized(msg.sender), AlreadyInitialized(msg.sender));
@@ -77,10 +93,11 @@ contract MultiOwnerValidator is IValidator {
         uint256 length = ids.length;
         for (uint256 i; i < length; ++i) {
             bytes32 ownerId = ids[i];
-            delete _owners[msg.sender][ownerId];
+            _clearOwner(_owners[ownerId][msg.sender]);
             delete _ownerIndex[msg.sender][ownerId];
         }
         delete _ownerIds[msg.sender];
+        delete _totalValidationData[msg.sender];
     }
 
     /// @notice Adds an owner to the caller's validator configuration.
@@ -97,7 +114,12 @@ contract MultiOwnerValidator is IValidator {
         require(_ownerIndex[msg.sender][config.ownerId] != 0, OwnerDoesNotExist(config.ownerId));
         _validateOwnerConfig(config);
 
-        _owners[msg.sender][config.ownerId] = Owner(config.statelessValidator, config.validationData);
+        Owner storage owner = _owners[config.ownerId][msg.sender];
+        uint256 newTotal = _totalValidationData[msg.sender] - owner.validationDataLength + config.validationData.length;
+        require(newTotal <= MAX_TOTAL_VALIDATION_DATA, ValidationDataLimitExceeded(newTotal, MAX_TOTAL_VALIDATION_DATA));
+
+        _storeOwner(owner, config.statelessValidator, config.validationData);
+        _totalValidationData[msg.sender] = newTotal;
         emit OwnerUpdated(msg.sender, config.ownerId, config.statelessValidator, config.validationData);
     }
 
@@ -119,7 +141,9 @@ contract MultiOwnerValidator is IValidator {
         }
         ids.pop();
 
-        delete _owners[msg.sender][ownerId];
+        Owner storage owner = _owners[ownerId][msg.sender];
+        _totalValidationData[msg.sender] -= owner.validationDataLength;
+        _clearOwner(owner);
         delete _ownerIndex[msg.sender][ownerId];
 
         emit OwnerRemoved(msg.sender, ownerId);
@@ -168,8 +192,12 @@ contract MultiOwnerValidator is IValidator {
         view
         returns (address statelessValidator, bytes memory validationData)
     {
-        Owner storage owner = _owners[account][ownerId];
-        return (owner.statelessValidator, owner.validationData);
+        Owner storage owner = _owners[ownerId][account];
+        return (owner.statelessValidator, _loadValidationData(owner));
+    }
+
+    function totalValidationData(address account) external view returns (uint256) {
+        return _totalValidationData[account];
     }
 
     function _isInitialized(address account) internal view returns (bool) {
@@ -181,9 +209,13 @@ contract MultiOwnerValidator is IValidator {
         require(_ownerIndex[account][config.ownerId] == 0, OwnerAlreadyExists(config.ownerId));
         _validateOwnerConfig(config);
 
-        _owners[account][config.ownerId] = Owner(config.statelessValidator, config.validationData);
+        uint256 newTotal = _totalValidationData[account] + config.validationData.length;
+        require(newTotal <= MAX_TOTAL_VALIDATION_DATA, ValidationDataLimitExceeded(newTotal, MAX_TOTAL_VALIDATION_DATA));
+
+        _storeOwner(_owners[config.ownerId][account], config.statelessValidator, config.validationData);
         _ownerIds[account].push(config.ownerId);
         _ownerIndex[account][config.ownerId] = _ownerIds[account].length;
+        _totalValidationData[account] = newTotal;
 
         emit OwnerAdded(account, config.ownerId, config.statelessValidator, config.validationData);
     }
@@ -213,17 +245,72 @@ contract MultiOwnerValidator is IValidator {
             ownerId := calldataload(signature.offset)
         }
 
-        Owner storage owner = _owners[account][ownerId];
+        Owner storage owner = _owners[ownerId][account];
         bytes calldata ownerSignature = signature[32:];
 
         if (owner.statelessValidator == address(0)) return false;
+        bytes memory validationData = _loadValidationData(owner);
         try IStatelessValidator(owner.statelessValidator)
-            .validateSignatureWithData(hash, ownerSignature, owner.validationData) returns (
+            .validateSignatureWithData(hash, ownerSignature, validationData) returns (
             bool isValid
         ) {
             return isValid;
         } catch {
             return false;
         }
+    }
+
+    function _storeOwner(Owner storage owner, address statelessValidator, bytes memory validationData) internal {
+        uint256 oldWordCount = _wordCount(owner.validationDataLength);
+        uint256 length = validationData.length;
+        uint256 newWordCount = _wordCount(length);
+
+        owner.statelessValidator = statelessValidator;
+        // Safe because every caller enforces length <= MAX_TOTAL_VALIDATION_DATA (4096).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        owner.validationDataLength = uint16(length);
+
+        for (uint256 i; i < newWordCount; ++i) {
+            bytes32 word;
+            assembly ("memory-safe") {
+                word := mload(add(add(validationData, 0x20), mul(i, 0x20)))
+            }
+
+            if (i + 1 == newWordCount && length & 31 != 0) {
+                uint256 validBytes = length & 31;
+                word = bytes32(uint256(word) & (type(uint256).max << ((32 - validBytes) * 8)));
+            }
+            owner.validationDataWords[i] = word;
+        }
+
+        for (uint256 i = newWordCount; i < oldWordCount; ++i) {
+            delete owner.validationDataWords[i];
+        }
+    }
+
+    function _loadValidationData(Owner storage owner) internal view returns (bytes memory validationData) {
+        uint256 length = owner.validationDataLength;
+        validationData = new bytes(length);
+
+        uint256 wordCount = _wordCount(length);
+        for (uint256 i; i < wordCount; ++i) {
+            bytes32 word = owner.validationDataWords[i];
+            assembly ("memory-safe") {
+                mstore(add(add(validationData, 0x20), mul(i, 0x20)), word)
+            }
+        }
+    }
+
+    function _clearOwner(Owner storage owner) internal {
+        uint256 wordCount = _wordCount(owner.validationDataLength);
+        for (uint256 i; i < wordCount; ++i) {
+            delete owner.validationDataWords[i];
+        }
+        delete owner.statelessValidator;
+        delete owner.validationDataLength;
+    }
+
+    function _wordCount(uint256 length) internal pure returns (uint256) {
+        return (length + 31) >> 5;
     }
 }
