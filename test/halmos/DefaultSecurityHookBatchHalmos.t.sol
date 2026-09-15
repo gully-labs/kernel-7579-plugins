@@ -73,13 +73,11 @@ contract DefaultSecurityHookBatchHalmos is SymTest {
         );
     }
 
-    /// @dev Full preCheck msgData: [0:4] dummy execute selector, then ABI-encoded
-    ///      (bytes32 mode, bytes executionData) — the assembly at :126-131 dereferences the
-    ///      executionData offset word at msgData[36:68], so the inner bytes must be ABI-framed.
+    /// @dev Full preCheck msgData: canonical `execute(bytes32,bytes)` calldata.
     ///      mode high byte 0x01 = CALLTYPE_BATCH.
     function _buildBatchMsgData(uint256 v0, bytes4 s0, uint256 v1, bytes4 s1) internal view returns (bytes memory) {
         bytes32 mode = bytes32(uint256(0x01) << 248); // CALLTYPE_BATCH
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, _encodeBatch2(v0, s0, v1, s1)));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, _encodeBatch2(v0, s0, v1, s1));
         return abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
     }
 
