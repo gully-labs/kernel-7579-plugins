@@ -61,9 +61,7 @@ contract DefaultSecurityHookDenyModuleHalmos is SymTest {
     {
         bytes32 mode = bytes32(0); // high byte == 0x00 => CALLTYPE_SINGLE
         bytes memory executionData = abi.encodePacked(target, value, selector);
-        // preCheck reads the inner `msgData` param as: [0:4] dummy selector, [4:36] mode,
-        // [36:68] ABI offset for the executionData bytes, then length + data.
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
     }
 
@@ -86,6 +84,31 @@ contract DefaultSecurityHookDenyModuleHalmos is SymTest {
         uint256 value = svm.createUint256("value");
         bytes4 selector = svm.createBytes4("selector");
 
+        bytes memory msgData = _buildSingleMsgData(TARGET, value, selector);
+
+        vm.prank(ACCOUNT);
+        (bool ok, bytes memory ret) = address(hook).call(msgData);
+
+        assert(!ok);
+        assert(
+            keccak256(ret)
+                == keccak256(abi.encodeWithSelector(DefaultSecurityHook.ModuleCallNotAllowed.selector, TARGET))
+        );
+    }
+
+    /// @notice A module target remains denied after a blanket allowlist entry is added. This pins
+    ///         the hard module boundary ahead of the allowlist and prevents permissions from
+    ///         allowlisting policy/signer callbacks back into reach.
+    function check_DenyAllowlistedModuleCall() external {
+        _makeTargetModule();
+
+        vm.prank(ACCOUNT);
+        hook.onInstall("");
+        vm.prank(ACCOUNT);
+        hook.setAllowlist(TARGET, new bytes4[](0));
+
+        uint256 value = svm.createUint256("value");
+        bytes4 selector = svm.createBytes4("selector");
         bytes memory msgData = _buildSingleMsgData(TARGET, value, selector);
 
         vm.prank(ACCOUNT);
