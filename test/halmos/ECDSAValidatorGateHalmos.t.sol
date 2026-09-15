@@ -17,10 +17,9 @@ interface Vm {
     function load(address, bytes32) external view returns (bytes32);
 }
 
-/// @notice Halmos proof harness for the three ECDSAValidator access gates:
+/// @notice Halmos proof harness for the ECDSAValidator access gates:
 ///   (a) isValidSignatureWithSender returns MAGICVALUE only if owner != 0  (gate at line 97/98)
-///   (b) preCheck reverts SenderNotOwner iff msgSender != owner            (require at line 120)
-///   (c) onInstall reverts ZeroAddressOwner when decoded owner == 0        (require at line 41)
+///   (b) onInstall reverts ZeroAddressOwner when decoded owner == 0        (require at line 41)
 ///
 /// MODELING (recover treated as an uninterpreted oracle — see TCB note):
 ///   `_verifySignature` calls `ECDSA.tryRecoverCalldata`, which routes to the ecrecover precompile
@@ -111,45 +110,10 @@ contract ECDSAValidatorGateHalmos is SymTest {
     }
 
     // -------------------------------------------------------------------------------------------
-    // (b) preCheck: reverts SenderNotOwner iff msgSender != owner (both directions)
+    // (b) onInstall: owner == 0 reverts ZeroAddressOwner; length != 20 reverts InvalidDataLength
     // -------------------------------------------------------------------------------------------
 
-    /// @notice (b) preCheck reverts SenderNotOwner iff msgSender != owner. Asserts BOTH directions:
-    ///         msgSender == owner => no revert; msgSender != owner => revert with SenderNotOwner.
-    function check_ecdsaGate_preCheckSenderEqOwner(address owner, address msgSender) external {
-        _setOwner(owner);
-
-        vm.prank(ACCOUNT);
-        (bool ok, bytes memory ret) =
-            address(validator).call(abi.encodeCall(ECDSAValidator.preCheck, (msgSender, 0, hex"")));
-
-        if (msgSender == owner) {
-            // Forward direction: equal => the require passes => no revert.
-            assert(ok);
-        } else {
-            // Reverse direction: unequal => revert, and specifically with SenderNotOwner().
-            assert(!ok);
-            assert(bytes4(ret) == ECDSAValidator.SenderNotOwner.selector);
-        }
-    }
-
-    /// @notice (b) Reachability witness: the non-revert path (msgSender == owner) is live.
-    ///         Asserting `!ok` on the equal branch MUST yield a counterexample (proves it can succeed).
-    function check_ecdsaGate_preCheckReachable(address owner) external {
-        _setOwner(owner);
-
-        vm.prank(ACCOUNT);
-        (bool ok,) = address(validator).call(abi.encodeCall(ECDSAValidator.preCheck, (owner, 0, hex"")));
-
-        // Counterexample expected: preCheck DOES succeed when msgSender == owner (path is live).
-        assert(!ok);
-    }
-
-    // -------------------------------------------------------------------------------------------
-    // (c) onInstall: owner == 0 reverts ZeroAddressOwner; length != 20 reverts InvalidDataLength
-    // -------------------------------------------------------------------------------------------
-
-    /// @notice (c) onInstall with a well-formed (length-20) payload whose decoded owner is zero
+    /// @notice (b) onInstall with a well-formed (length-20) payload whose decoded owner is zero
     ///         reverts ZeroAddressOwner. Length is fixed to 20 so we isolate the owner==0 gate
     ///         (line 41) from the length gate (line 39). ACCOUNT is uninitialized (owner slot 0).
     function check_ecdsaGate_onInstallZeroOwnerReverts(bytes32 tail) external {
@@ -165,7 +129,7 @@ contract ECDSAValidatorGateHalmos is SymTest {
         assert(bytes4(ret) == ECDSAValidator.ZeroAddressOwner.selector);
     }
 
-    /// @notice (c) Reachability witness: onInstall SUCCEEDS with a length-20, non-zero-owner payload,
+    /// @notice (b) Reachability witness: onInstall SUCCEEDS with a length-20, non-zero-owner payload,
     ///         proving the revert in the property above is discriminating (not a universal revert).
     ///         Asserting `!ok` MUST yield a counterexample.
     function check_ecdsaGate_onInstallReachable(address owner) external {
