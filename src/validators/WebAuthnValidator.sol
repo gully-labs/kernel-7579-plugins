@@ -15,7 +15,8 @@ import {
     ERC1271_MAGICVALUE,
     ERC1271_INVALID
 } from "src/types/Constants.sol";
-import {WebAuthn} from "solady/utils/WebAuthn.sol";
+import {P256Validation} from "src/utils/P256Validation.sol";
+import {WebAuthnValidation} from "src/utils/WebAuthnValidation.sol";
 
 struct WebAuthnValidatorData {
     uint256 pubKeyX;
@@ -39,14 +40,15 @@ contract WebAuthnValidator is IValidator, IStatelessValidator, IStatelessValidat
     /**
      * @notice Install WebAuthn validator for a kernel account.
      * @dev The kernel account need to be the `msg.sender`.
-     * @dev The public key is encoded as `abi.encode(WebAuthnValidatorData)` inside the data, so (uint256,uint256).
+     * @dev `_data` must contain the 96-byte encoding
+     *      `abi.encode(WebAuthnValidatorData(pubKeyX, pubKeyY), bytes32 authenticatorIdHash)`.
      */
     function onInstall(bytes calldata _data) external payable override {
         // check if the webauthn validator is already initialized
         if (_isInitialized(msg.sender)) revert AlreadyInitialized(msg.sender);
         // check validity of the public key
         (WebAuthnValidatorData memory webAuthnData,) = abi.decode(_data, (WebAuthnValidatorData, bytes32));
-        if (webAuthnData.pubKeyX == 0 || webAuthnData.pubKeyY == 0) {
+        if (!P256Validation.isValidPublicKey(webAuthnData.pubKeyX, webAuthnData.pubKeyY)) {
             revert InvalidPublicKey();
         }
         // Update the key (so a sstore)
@@ -74,7 +76,8 @@ contract WebAuthnValidator is IValidator, IStatelessValidator, IStatelessValidat
     }
 
     function _isInitialized(address smartAccount) internal view returns (bool) {
-        return webAuthnValidatorStorage[smartAccount].pubKeyX != 0;
+        WebAuthnValidatorData storage key = webAuthnValidatorStorage[smartAccount];
+        return key.pubKeyX != 0 || key.pubKeyY != 0;
     }
 
     /**
@@ -118,8 +121,9 @@ contract WebAuthnValidator is IValidator, IStatelessValidator, IStatelessValidat
 
     /**
      * @notice Verify a signature.
-     * @dev `signature` is `abi.encode(authenticatorData, clientDataJSON, challengeLocation,
-     *      responseTypeLocation, r, s)`.
+     * @dev `signature` is the legacy encoding
+     *      `abi.encode(authenticatorData, clientDataJSON, responseTypeLocation, r, s, usePrecompiled)`.
+     *      `usePrecompiled` is retained for ABI compatibility and ignored.
      * @dev Virtual to let formal-verification harnesses model only the cryptographic boundary.
      */
     function _verifySignature(bytes32 hash, bytes calldata signature, WebAuthnValidatorData memory webAuthnData)
@@ -132,23 +136,21 @@ contract WebAuthnValidator is IValidator, IStatelessValidator, IStatelessValidat
         (
             bytes memory authenticatorData,
             string memory clientDataJSON,
-            uint256 challengeLocation,
             uint256 responseTypeLocation,
             uint256 r,
-            uint256 s
-        ) = abi.decode(signature, (bytes, string, uint256, uint256, uint256, uint256));
+            uint256 s,
+            /* usePrecompiled */
+        ) = abi.decode(signature, (bytes, string, uint256, uint256, uint256, bool));
 
-        bool isValid = WebAuthn.verify(
-            abi.encodePacked(hash),
-            true,
+        bool isValid = WebAuthnValidation.verify(
+            hash,
             authenticatorData,
             clientDataJSON,
-            challengeLocation,
             responseTypeLocation,
-            bytes32(r),
-            bytes32(s),
-            bytes32(webAuthnData.pubKeyX),
-            bytes32(webAuthnData.pubKeyY)
+            r,
+            s,
+            webAuthnData.pubKeyX,
+            webAuthnData.pubKeyY
         );
 
         // return the validation data
@@ -166,7 +168,7 @@ contract WebAuthnValidator is IValidator, IStatelessValidator, IStatelessValidat
     {
         if (data.length != 96) return false;
         (WebAuthnValidatorData memory webAuthnData,) = abi.decode(data, (WebAuthnValidatorData, bytes32));
-        if (webAuthnData.pubKeyX == 0 || webAuthnData.pubKeyY == 0) return false;
+        if (!P256Validation.isValidPublicKey(webAuthnData.pubKeyX, webAuthnData.pubKeyY)) return false;
         return _verifySignature(hash, signature, webAuthnData) == SIG_VALIDATION_SUCCESS_UINT;
     }
 }
