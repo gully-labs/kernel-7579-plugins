@@ -37,7 +37,10 @@ struct GuardianStorage {
 contract WeightedECDSAValidator is EIP712, WeightedThresholdBase, IValidator {
     /// @dev EIP712 typehash for the Proposal struct (id fixed to bytes32(0): one config per account).
     bytes32 private constant PROPOSAL_TYPEHASH =
-        keccak256("Proposal(address account,bytes32 id,bytes callData,uint256 nonce)");
+        keccak256("Proposal(address account,bytes32 id,bytes callData,uint256 nonce,uint256 configurationEpoch)");
+    bytes32 private constant USER_OP_TYPEHASH =
+        keccak256("WeightedUserOperation(bytes32 userOpHash,uint256 configurationEpoch)");
+    uint256 private constant REPLAYABLE_MODE_MASK = uint256(0x40) << 248;
 
     error ZeroWeightSigner();
     error SignersNotSorted();
@@ -52,12 +55,14 @@ contract WeightedECDSAValidator is EIP712, WeightedThresholdBase, IValidator {
 
     mapping(address kernel => WeightedECDSAValidatorStorage) public weightedStorage;
     mapping(address guardian => mapping(address kernel => GuardianStorage)) public guardian;
+    /// @notice Monotonically increasing configuration version. It intentionally survives uninstall.
+    mapping(address kernel => uint256) public configurationEpoch;
 
     event GuardianAdded(address indexed guardian, address indexed kernel, uint24 weight);
     event GuardianRemoved(address indexed guardian, address indexed kernel);
 
     function _domainNameAndVersion() internal pure override returns (string memory, string memory) {
-        return ("WeightedECDSAValidator", "0.0.4");
+        return ("WeightedECDSAValidator", "0.0.5");
     }
 
     function _revertZeroWeightSigner() internal pure override {
@@ -83,6 +88,8 @@ contract WeightedECDSAValidator is EIP712, WeightedThresholdBase, IValidator {
 
     function onInstall(bytes calldata _data) external payable override {
         if (_isInitialized(msg.sender)) revert AlreadyInitialized(msg.sender);
+
+        configurationEpoch[msg.sender]++;
 
         (address[] memory _guardians, uint24[] memory _weights, uint24 _threshold) =
             abi.decode(_data, (address[], uint24[], uint24));
@@ -143,15 +150,21 @@ contract WeightedECDSAValidator is EIP712, WeightedThresholdBase, IValidator {
         uint256 threshold = weightedStorage[msg.sender].threshold;
         // Split signature scheme: first N-1 sigs over the EIP712 proposalHash (id = 0), last sig
         // over the ep-specific final userOp hash. See WeightedThresholdBase._verifyUserOp.
-        bytes32 proposalHash = _hashTypedData(
-            keccak256(
-                abi.encode(PROPOSAL_TYPEHASH, userOp.sender, bytes32(0), keccak256(userOp.callData), userOp.nonce)
-            )
+        uint256 epoch = configurationEpoch[msg.sender];
+        bool replayable = userOp.nonce & REPLAYABLE_MODE_MASK != 0;
+        bytes32 proposalStructHash = keccak256(
+            abi.encode(PROPOSAL_TYPEHASH, userOp.sender, bytes32(0), keccak256(userOp.callData), userOp.nonce, epoch)
         );
-        bytes32 finalHash = _finalUserOpHash(userOpHash);
+        bytes32 proposalHash = _hashForMode(proposalStructHash, replayable);
+        bytes32 finalHash =
+            _hashForMode(keccak256(abi.encode(USER_OP_TYPEHASH, _finalUserOpHash(userOpHash), epoch)), replayable);
         return _verifyUserOp(bytes32(0), msg.sender, proposalHash, finalHash, userOp.signature, threshold)
             ? SIG_VALIDATION_SUCCESS_UINT
             : SIG_VALIDATION_FAILED_UINT;
+    }
+
+    function _hashForMode(bytes32 structHash, bool replayable) internal view returns (bytes32) {
+        return replayable ? _hashTypedDataSansChainId(structHash) : _hashTypedData(structHash);
     }
 
     /// @notice ERC-1271 validation. ep-agnostic and byte-identical across variants (signs `hash`
