@@ -5,24 +5,21 @@ import {Test} from "forge-std/Test.sol";
 import {SymTest} from "halmos-cheatcodes/SymTest.sol";
 import {TimelockPolicy} from "src/policies/TimelockPolicy.sol";
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
+import {MockTimelockEntryPoint} from "test/utils/MockTimelockEntryPoint.sol";
 
 /// @author taek <leekt216@gmail.com>
 /// @notice Halmos proof: executing a Pending, current-epoch TimelockPolicy proposal returns an
 ///         ERC-4337 packed validation window whose high 48 bits == the STORED proposal.validAfter,
 ///         next 48 bits == the STORED proposal.validUntil, and low 160 bits (authorizer) == 0 (success).
-/// @dev Property source: TimelockPolicy._handleProposalExecutionInternal returns
-///      _packValidationData(proposal.validAfter, proposal.validUntil) (L263); layout at
-///      _packValidationData (L342-344). The proposal is created through the REAL no-op creation
-///      path so the stored validAfter/validUntil are genuine (creation stamps L214-215).
+/// @dev The proposal is created through the canonical validation commitment followed by the real
+///      execution-phase createProposal call, so the stored validAfter/validUntil are genuine.
 ///      The assertion reads the STORED fields via the public getProposal getter (not a recompute
 ///      of block.timestamp+delay), then compares the extracted bitfields of the returned packed
 ///      value against them — the packing layout is the contract's public ABI to the EntryPoint.
-///      DISCLOSED ASSUMPTION: no uint48 wrap at creation. The install-time guard (L108)
-///      already enforces delay+expirationPeriod <= uint48.max - block.timestamp; that guard is the
-///      only overflow check and it is NOT re-evaluated at execution — we keep it satisfiable at
-///      creation, which is exactly that window.
+///      The symbolic parameters keep the execution-time uint48 bound satisfiable.
 contract TimelockExecWindowHalmos is SymTest, Test {
     TimelockPolicy policy;
+    MockTimelockEntryPoint entryPoint;
 
     // The (id, account) pair. account == address(this) is the caller of checkUserOpPolicy,
     // which becomes both userOp.sender and the storage account key.
@@ -32,18 +29,18 @@ contract TimelockExecWindowHalmos is SymTest, Test {
         // Etch runtime code to avoid halmos-0.3.3 routing `new` through deployCode. No constructor state.
         policy = TimelockPolicy(address(0xACE));
         vm.etch(address(policy), type(TimelockPolicy).runtimeCode);
+        entryPoint = MockTimelockEntryPoint(address(0xE11));
+        vm.etch(address(entryPoint), type(MockTimelockEntryPoint).runtimeCode);
     }
 
     function _installData(uint48 delay, uint48 expirationPeriod, address guardian)
         internal
-        pure
+        view
         returns (bytes memory)
     {
-        return abi.encodePacked(ID, abi.encode(delay, expirationPeriod, guardian));
+        return abi.encodePacked(ID, abi.encode(delay, expirationPeriod, guardian, address(entryPoint)));
     }
 
-    // A UserOp with empty callData is a no-op => routes to proposal CREATION.
-    // The signature carries the proposal payload: [callDataLength(32)][callData][nonce(32)].
     function _creationUserOp(bytes memory execCallData, uint256 proposalNonce)
         internal
         view
@@ -51,8 +48,8 @@ contract TimelockExecWindowHalmos is SymTest, Test {
     {
         op.sender = address(this);
         op.nonce = 0;
-        op.callData = ""; // no-op => creation branch
-        op.signature = abi.encodePacked(uint256(execCallData.length), execCallData, proposalNonce);
+        op.callData = policy.getProposalCreationCallData(ID, execCallData, proposalNonce);
+        op.paymasterAndData = abi.encodePacked(address(0xBEEF), uint128(1), uint128(1));
     }
 
     // A UserOp with real (non-no-op) callData + matching nonce => routes to EXECUTION of the
@@ -68,15 +65,21 @@ contract TimelockExecWindowHalmos is SymTest, Test {
         op.signature = "";
     }
 
+    function _commitAndCreate(bytes memory execCallData, uint256 proposalNonce) internal {
+        PackedUserOperation memory creation = _creationUserOp(execCallData, proposalNonce);
+        policy.checkUserOpPolicy(ID, creation);
+        entryPoint.setCurrentUserOpHash(policy.getEntryPointUserOpHash(ID, address(this), creation));
+        policy.createProposal(ID, execCallData, proposalNonce);
+    }
+
     /// @notice The exact window the EntryPoint reads: executing a live Pending/current-epoch proposal
     ///         returns _packValidationData(storedValidAfter, storedValidUntil) with success authorizer==0.
     ///         Single load-bearing assertion: the three extracted bitfields all match the stored state.
     function check_ExecReturnsStoredWindow(uint48 delay, uint48 expirationPeriod, uint256 proposalNonce) external {
-        // ---- Preconditions (genuine): install guard must be satisfiable so config is valid. ----
+        // Keep both installation and execution-time timestamp bounds satisfiable.
         vm.assume(delay > 0);
         vm.assume(expirationPeriod > 0);
         vm.assume(block.timestamp <= type(uint48).max);
-        // No-uint48-wrap-at-creation window (identical to the install guard, L108):
         vm.assume(uint256(delay) + uint256(expirationPeriod) <= uint256(type(uint48).max) - block.timestamp);
 
         // A concrete, non-no-op execution calldata (a plain 4-byte selector is NOT a recognized no-op).
@@ -84,8 +87,8 @@ contract TimelockExecWindowHalmos is SymTest, Test {
 
         policy.onInstall(_installData(delay, expirationPeriod, address(0)));
 
-        // Create the proposal (Pending, current epoch) via the real creation path.
-        policy.checkUserOpPolicy(ID, _creationUserOp(execCallData, proposalNonce));
+        // Validation commits the signed proposal fields; execution consumes the commitment.
+        _commitAndCreate(execCallData, proposalNonce);
 
         // Read the STORED window (public getter) BEFORE execution mutates status.
         (, uint256 storedValidAfter, uint256 storedValidUntil) =
@@ -119,7 +122,7 @@ contract TimelockExecWindowHalmos is SymTest, Test {
         bytes memory execCallData = hex"11223344";
 
         policy.onInstall(_installData(delay, expirationPeriod, address(0)));
-        policy.checkUserOpPolicy(ID, _creationUserOp(execCallData, proposalNonce));
+        _commitAndCreate(execCallData, proposalNonce);
 
         (, uint256 storedValidAfter, uint256 storedValidUntil) =
             policy.getProposal(address(this), execCallData, proposalNonce, ID, address(this));
