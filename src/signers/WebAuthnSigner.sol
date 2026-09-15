@@ -13,7 +13,8 @@ import {
 } from "src/types/Constants.sol";
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
 import {ERC1271_MAGICVALUE, ERC1271_INVALID} from "src/types/Constants.sol";
-import {WebAuthn} from "solady/utils/WebAuthn.sol";
+import {P256Validation} from "src/utils/P256Validation.sol";
+import {WebAuthnValidation} from "src/utils/WebAuthnValidation.sol";
 
 struct WebAuthnSignerData {
     uint256 pubKeyX;
@@ -94,8 +95,9 @@ contract WebAuthnSigner is SignerBase, IStatelessValidator, IStatelessValidatorW
 
     /**
      * @notice Verify a signature.
-     * @dev `signature` is `abi.encode(authenticatorData, clientDataJSON, challengeLocation,
-     *      responseTypeLocation, r, s)`.
+     * @dev `signature` is the legacy encoding
+     *      `abi.encode(authenticatorData, clientDataJSON, responseTypeLocation, r, s, usePrecompiled)`.
+     *      `usePrecompiled` is retained for ABI compatibility and ignored.
      * @dev Virtual to let formal-verification harnesses model only the cryptographic boundary.
      */
     function _verifySignature(bytes32 hash, bytes calldata signature, WebAuthnSignerData memory webAuthnData)
@@ -108,23 +110,21 @@ contract WebAuthnSigner is SignerBase, IStatelessValidator, IStatelessValidatorW
         (
             bytes memory authenticatorData,
             string memory clientDataJSON,
-            uint256 challengeLocation,
             uint256 responseTypeLocation,
             uint256 r,
-            uint256 s
-        ) = abi.decode(signature, (bytes, string, uint256, uint256, uint256, uint256));
+            uint256 s,
+            /* usePrecompiled */
+        ) = abi.decode(signature, (bytes, string, uint256, uint256, uint256, bool));
 
-        bool isValid = WebAuthn.verify(
-            abi.encodePacked(hash),
-            true,
+        bool isValid = WebAuthnValidation.verify(
+            hash,
             authenticatorData,
             clientDataJSON,
-            challengeLocation,
             responseTypeLocation,
-            bytes32(r),
-            bytes32(s),
-            bytes32(webAuthnData.pubKeyX),
-            bytes32(webAuthnData.pubKeyY)
+            r,
+            s,
+            webAuthnData.pubKeyX,
+            webAuthnData.pubKeyY
         );
 
         // return the validation data
@@ -141,24 +141,25 @@ contract WebAuthnSigner is SignerBase, IStatelessValidator, IStatelessValidatorW
     {
         if (data.length != 96) return false;
         (WebAuthnSignerData memory webAuthnData,) = abi.decode(data, (WebAuthnSignerData, bytes32));
-        if (webAuthnData.pubKeyX == 0 || webAuthnData.pubKeyY == 0) return false;
+        if (!P256Validation.isValidPublicKey(webAuthnData.pubKeyX, webAuthnData.pubKeyY)) return false;
         return _verifySignature(hash, signature, webAuthnData) == SIG_VALIDATION_SUCCESS_UINT;
     }
     /**
      * @notice Install WebAuthn signer for a kernel account.
      * @dev The kernel account need to be the `msg.sender`.
-     * @dev The public key is encoded as `abi.encode(WebAuthnSignerData)` inside the data, so (uint256,uint256).
+     * @dev The `_data` suffix after the 32-byte permission ID must contain the 96-byte encoding
+     *      `abi.encode(WebAuthnSignerData(pubKeyX, pubKeyY), bytes32 authenticatorIdHash)`.
      */
 
     function _signerOninstall(bytes32 id, bytes calldata _data) internal override {
         // check if this specific id is already initialized
-        if (webAuthnSignerStorage[id][msg.sender].pubKeyX != 0) {
+        if (webAuthnSignerStorage[id][msg.sender].pubKeyX != 0 || webAuthnSignerStorage[id][msg.sender].pubKeyY != 0) {
             revert AlreadyInitialized(msg.sender);
         }
         usedIds[msg.sender]++;
         // check validity of the public key
         (WebAuthnSignerData memory webAuthnData,) = abi.decode(_data, (WebAuthnSignerData, bytes32));
-        if (webAuthnData.pubKeyX == 0 || webAuthnData.pubKeyY == 0) {
+        if (!P256Validation.isValidPublicKey(webAuthnData.pubKeyX, webAuthnData.pubKeyY)) {
             revert InvalidPublicKey();
         }
         // Update the key (so a sstore)
@@ -173,7 +174,7 @@ contract WebAuthnSigner is SignerBase, IStatelessValidator, IStatelessValidatorW
      */
     function _signerOnUninstall(bytes32 id, bytes calldata) internal override {
         // check if this specific id is initialized
-        if (webAuthnSignerStorage[id][msg.sender].pubKeyX == 0) {
+        if (webAuthnSignerStorage[id][msg.sender].pubKeyX == 0 && webAuthnSignerStorage[id][msg.sender].pubKeyY == 0) {
             revert NotInitialized(msg.sender);
         }
         delete webAuthnSignerStorage[id][msg.sender];
