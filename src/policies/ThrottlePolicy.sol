@@ -51,7 +51,7 @@ contract ThrottlePolicy is PolicyBase {
         returns (uint256)
     {
         require(status[id][msg.sender] == Status.Live, PolicyNotLive());
-        return SIG_VALIDATION_SUCCESS_UINT;
+        return SIG_VALIDATION_FAILED_UINT;
     }
 
     function _policyOninstall(bytes32 id, bytes calldata _data) internal override {
