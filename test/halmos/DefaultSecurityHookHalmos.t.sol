@@ -50,10 +50,9 @@ contract DefaultSecurityHookHalmos is SymTest {
         vm.prank(account);
         hook.setAllowlist(target, new bytes4[](0)); // empty => allSelectorsAllowed
 
-        // preCheck's `msgData` param layout is [0:4] execute selector, [4:36] mode, [36:] data.
-        // getCallType reads bytes1(msgData[4:36]) == param byte[4]. The param MUST therefore start
-        // with a 4-byte (dummy) selector so `mode` lands at [4:36] and its high byte (0xff) is byte[4].
-        bytes memory param = abi.encodePacked(bytes4(0), mode, executionData);
+        // Use the canonical ERC-7579 execute callback shape. Callback dispatch and outer ABI
+        // validation run before the call-type branch.
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
 
         vm.prank(account);
@@ -80,7 +79,7 @@ contract DefaultSecurityHookHalmos is SymTest {
         vm.prank(account);
         hook.setAllowlist(target, new bytes4[](0));
 
-        bytes memory param = abi.encodePacked(bytes4(0), mode, executionData);
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
 
         vm.prank(account);
@@ -196,14 +195,11 @@ contract DefaultSecurityHookHalmos is SymTest {
 
     // ==================================================================================
     // Self-call gate: preCheck reverts SelfCallNotAllowed for a SINGLE call whose decoded
-    // target == the account (msg.sender), when that (self,selector) pair is NOT allowlisted.
+    // target == the account (msg.sender), regardless of the allowlist.
     // ==================================================================================
 
     /// @notice preCheck reverts SelfCallNotAllowed when the SINGLE-call decoded target equals the
-    ///         account (msg.sender) and self is NOT allowlisted for the call. Source:
-    ///         DefaultSecurityHook.sol:193 `if (target == msg.sender) revert SelfCallNotAllowed()`,
-    ///         reached because the allowlist-first branch (:187-190) does not return for a
-    ///         non-allowlisted entry. Asserts the specific revert selector (non-tautological): a
+    ///         account (msg.sender). Asserts the specific revert selector (non-tautological): a
     ///         different revert (e.g. UnsupportedCallType, DecodingError) would be a false pass.
     function check_DenySelfCall() external {
         // Symbolic value and 4-byte data so the gate holds for any selector/value.
@@ -213,9 +209,6 @@ contract DefaultSecurityHookHalmos is SymTest {
         address account = svm.createAddress("account");
         vm.prank(account);
         hook.onInstall("");
-        // NOT allowlisted: no setAllowlist call => allowlist[account][account].allowed == false,
-        // so the allowlist-first branch is skipped and control reaches the self-call gate.
-
         // executionData for a single call: abi.encodePacked(target(20), value(32), data).
         // target == account == msg.sender pins the self-call precondition.
         bytes memory executionData = abi.encodePacked(account, value, selector);
@@ -224,11 +217,33 @@ contract DefaultSecurityHookHalmos is SymTest {
         uint256 modeTail = svm.createUint(248, "modeTail");
         bytes32 mode = bytes32(modeTail); // high byte (callType) == 0x00 = SINGLE
 
-        // preCheck reads msgData as [0:4] dummy selector, then ABI-encoded (bytes32 mode, bytes
-        // executionData) at [4:]; it resolves executionData via the ABI offset word at [36:68], so
-        // for the SINGLE branch (which dereferences executionData) it MUST be ABI-encoded
-        // (offset+length+data), NOT packed (unlike the delegatecall harness which never reads it).
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
+        bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
+
+        vm.prank(account);
+        (bool ok, bytes memory ret) = address(hook).call(msgData);
+
+        assert(!ok);
+        assert(bytes4(ret) == DefaultSecurityHook.SelfCallNotAllowed.selector);
+    }
+
+    /// @notice The account target remains denied after a blanket allowlist entry is added. This
+    ///         prevents a restricted permission from allowlisting Kernel management selectors and
+    ///         using a self-call to provide mismatched module and internal permission IDs.
+    function check_DenyAllowlistedSelfCall() external {
+        uint256 value = svm.createUint256("value");
+        bytes4 selector = svm.createBytes4("selector");
+
+        address account = svm.createAddress("account");
+        vm.prank(account);
+        hook.onInstall("");
+        vm.prank(account);
+        hook.setAllowlist(account, new bytes4[](0));
+
+        bytes memory executionData = abi.encodePacked(account, value, selector);
+        uint256 modeTail = svm.createUint(248, "modeTail");
+        bytes32 mode = bytes32(modeTail);
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
 
         vm.prank(account);
@@ -255,7 +270,7 @@ contract DefaultSecurityHookHalmos is SymTest {
         uint256 modeTail = svm.createUint(248, "modeTail");
         bytes32 mode = bytes32(modeTail);
 
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
 
         vm.prank(account);
@@ -297,11 +312,7 @@ contract DefaultSecurityHookHalmos is SymTest {
         vm.prank(account);
         hook.setAllowlist(target, new bytes4[](0));
 
-        // preCheck reads msgData[4:] as ABI-encoded (bytes32 mode, bytes executionData): the
-        // executionData OFFSET word at msgData[36:68] must be the concrete 0x40, so use abi.encode
-        // (NOT abi.encodePacked) for the (mode, executionData) tail — the assembly at :126-131
-        // runs BEFORE the else at :143 and dereferences that offset, needing it concrete.
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
 
         vm.prank(account);
@@ -333,8 +344,7 @@ contract DefaultSecurityHookHalmos is SymTest {
         vm.prank(account);
         hook.setAllowlist(target, new bytes4[](0));
 
-        // abi.encode (not packed): concrete executionData offset word for the :126-131 assembly.
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         bytes memory msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
 
         vm.prank(account);
