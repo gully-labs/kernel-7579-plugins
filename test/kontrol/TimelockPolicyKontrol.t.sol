@@ -25,19 +25,21 @@ import {Test} from "forge-std/Test.sol";
 import {KontrolCheats} from "kontrol-cheatcodes/KontrolCheats.sol";
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
 import {TimelockPolicy} from "src/policies/TimelockPolicy.sol";
+import {MockTimelockEntryPoint} from "test/utils/MockTimelockEntryPoint.sol";
 
 contract TimelockPolicyKontrol is Test, KontrolCheats {
     TimelockPolicy internal policy;
+    MockTimelockEntryPoint internal entryPoint;
 
     uint256 constant SUCCESS_AUTHORIZER = 0; // low 160 bits == 0 on success
     uint256 constant FAILED = 1; // SIG_VALIDATION_FAILED_UINT
 
     function setUp() public {
         policy = new TimelockPolicy();
+        entryPoint = new MockTimelockEntryPoint();
     }
 
-    // A non-no-op callData: 4 bytes that are NOT executeUserOp/execute selectors and
-    // length < 100 so _isNoOpCalldata returns false and we hit the EXECUTION path.
+    // A normal execution calldata that is distinct from canonical proposal creation.
     function _execCallData() internal pure returns (bytes memory) {
         return hex"deadbeef";
     }
@@ -54,24 +56,23 @@ contract TimelockPolicyKontrol is Test, KontrolCheats {
         uint48 delay = 1;
         uint48 expiration = 1;
         // guardian = 0
-        bytes memory data = abi.encode(delay, expiration, address(0));
+        bytes memory data = abi.encode(delay, expiration, address(0), address(entryPoint));
         vm.prank(address(0xA11CE));
         policy.onInstall(abi.encodePacked(id, data));
     }
 
-    // Legitimately create a Pending proposal for (sender, callData, nonce) by sending a
-    // no-op UserOp whose signature carries the proposal (callData,nonce). This stamps
-    // proposal.epoch = currentEpoch at creation time.
+    // Legitimately create a Pending proposal through validation commitment and account execution.
     function _createProposal(bytes32 id, bytes memory callData, uint256 nonce) internal {
         PackedUserOperation memory op;
         op.sender = address(0xA11CE);
-        op.nonce = 999; // the CURRENT op nonce is irrelevant; proposal keyed by sig data
-        op.callData = ""; // empty => no-op path => creation
-
-        // sig format: [callDataLen(32)][callData][nonce(32)]
-        op.signature = abi.encodePacked(bytes32(callData.length), callData, bytes32(nonce));
+        op.nonce = 999;
+        op.callData = policy.getProposalCreationCallData(id, callData, nonce);
+        op.paymasterAndData = abi.encodePacked(address(0xBEEF), uint128(1), uint128(1));
         vm.prank(address(0xA11CE));
         policy.checkUserOpPolicy(id, op);
+        entryPoint.setCurrentUserOpHash(policy.getEntryPointUserOpHash(id, address(0xA11CE), op));
+        vm.prank(address(0xA11CE));
+        policy.createProposal(id, callData, nonce);
     }
 
     // ==========================================================================
