@@ -5,7 +5,7 @@ import {ThrottlePolicy, Status} from "src/policies/ThrottlePolicy.sol";
 import {ValidAfter} from "src/types/Types.sol";
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
 import {IModule} from "src/interfaces/IERC7579Modules.sol";
-import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
+import {SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
 
 contract ThrottlePolicyTest is PolicyTestBase {
     uint48 constant INTERVAL = 100;
@@ -99,10 +99,16 @@ contract ThrottlePolicyTest is PolicyTestBase {
         assertEq(result, SIG_VALIDATION_FAILED_UINT, "should return failure once count is exhausted");
     }
 
-    // checkSignaturePolicy returns SIG_VALIDATION_SUCCESS_UINT unconditionally once Live (see
-    // ThrottlePolicy.checkSignaturePolicy) — there is no signature-shape based failure to model
-    // with a valid/invalid signature pair, so the base "fail" test's premise does not apply.
-    // Override to assert the real, unconditional-success-when-Live behavior instead.
+    function testPolicyCheckSignaturePolicySuccess() public payable override {
+        bytes32 id = policyId();
+        vm.startPrank(WALLET);
+        policy.onInstall(abi.encodePacked(id, installData()));
+        uint256 result = policy.checkSignaturePolicy(id, WALLET, keccak256("hash"), "");
+        vm.stopPrank();
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "throttles cannot authorize ERC-1271 signatures");
+    }
+
     function testPolicyCheckSignaturePolicyFail() public payable override {
         bytes32 id = policyId();
         vm.startPrank(WALLET);
@@ -113,7 +119,25 @@ contract ThrottlePolicyTest is PolicyTestBase {
 
         uint256 result = policy.checkSignaturePolicy(id, sender, testHash, sigData);
         vm.stopPrank();
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "checkSignaturePolicy always succeeds when Live");
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "all ERC-1271 inputs must be rejected");
+    }
+
+    function testFuzz_checkSignaturePolicy_RejectsEveryERC1271Input(
+        address sender,
+        bytes32 hash,
+        bytes calldata signature
+    ) public {
+        bytes32 id = policyId();
+        vm.prank(WALLET);
+        policy.onInstall(abi.encodePacked(id, installData()));
+
+        vm.prank(WALLET);
+        uint256 result = policy.checkSignaturePolicy(id, sender, hash, signature);
+        assertEq(result, SIG_VALIDATION_FAILED_UINT);
+
+        (, uint48 remaining, ValidAfter startAt) = policy.throttleConfigs(id, WALLET);
+        assertEq(remaining, COUNT, "ERC-1271 rejection must not consume the UserOp budget");
+        assertEq(ValidAfter.unwrap(startAt), START_AT);
     }
 
     function test_onInstall_SetsConfigAndStatus() public {
@@ -280,13 +304,13 @@ contract ThrottlePolicyTest is PolicyTestBase {
         policy.checkSignaturePolicy(policyId(), WALLET, keccak256("hash"), "");
     }
 
-    function test_checkSignaturePolicy_ReturnsSuccessWhenLive() public {
+    function test_checkSignaturePolicy_ReturnsFailureWhenLive() public {
         bytes32 id = policyId();
         vm.startPrank(WALLET);
         policy.onInstall(abi.encodePacked(id, installData()));
 
         uint256 result = policy.checkSignaturePolicy(id, WALLET, keccak256("hash"), "");
         vm.stopPrank();
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "checkSignaturePolicy should succeed when Live");
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "throttle policy must reject ERC-1271 validation");
     }
 }
