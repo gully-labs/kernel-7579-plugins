@@ -5,6 +5,7 @@ import {SymTest} from "halmos-cheatcodes/SymTest.sol";
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
 import {WebAuthnValidator, WebAuthnValidatorData} from "src/validators/WebAuthnValidator.sol";
 import {WebAuthnSigner, WebAuthnSignerData} from "src/signers/WebAuthnSigner.sol";
+import {P256Validation} from "src/utils/P256Validation.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
 
 // Minimal cheatcode surface. Inheriting forge-std `Test` pulls in a base constructor that calls
@@ -25,7 +26,7 @@ interface Vm {
 ///         (bytes,string,...) abi.decode of the signature — intractable for Halmos and reported
 ///         OUT-OF-SCOPE (claims (a)/(b) SUCCESS-tracking). This harness proves the observable
 ///         lifecycle behaviour that does not decode the signature:
-///           (c) onInstall rejects pubKeyX==0 || pubKeyY==0 (InvalidPublicKey),
+///           (c) onInstall rejects coordinates that are not a P-256 curve point (InvalidPublicKey),
 ///               reverts AlreadyInitialized on double-install;
 ///               onUninstall reverts NotInitialized when unset;
 ///               WebAuthnSigner increments/decrements usedIds without underflow;
@@ -45,6 +46,8 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     bytes4 internal constant ALREADY_INIT = bytes4(keccak256("AlreadyInitialized(address)"));
     bytes4 internal constant NOT_INIT = bytes4(keccak256("NotInitialized(address)"));
     bytes4 internal constant INVALID_PUBKEY = bytes4(keccak256("InvalidPublicKey()"));
+    uint256 internal constant VALID_X = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296;
+    uint256 internal constant VALID_Y = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5;
 
     function setUp() external {
         // Halmos 0.3.3 cannot execute the via_ir creation bytecode (routes to an unsupported
@@ -81,13 +84,13 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     // (c) VALIDATOR LIFECYCLE
     // =============================================================================================
 
-    /// @notice onInstall reverts InvalidPublicKey iff either coordinate is zero; otherwise it stores
+    /// @notice onInstall reverts InvalidPublicKey iff the coordinates are not on P-256; otherwise it stores
     ///         the (x,y) under webAuthnValidatorStorage[msg.sender] and marks the account initialized.
     ///         Observable: revert-selector / stored-value, no signature decode.
     function check_Validator_onInstall_pubkeyGuardAndStore(uint256 x, uint256 y) external {
         vm.prank(CALLER);
         (bool ok, bytes memory ret) = address(validator).call(abi.encodeCall(validator.onInstall, (_valData(x, y))));
-        if (x == 0 || y == 0) {
+        if (!P256Validation.isValidPublicKey(x, y)) {
             assert(!ok && _selector(ret) == INVALID_PUBKEY);
         } else {
             assert(ok);
@@ -100,7 +103,7 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
 
     /// @notice Double-install reverts AlreadyInitialized.
     function check_Validator_onInstall_doubleReverts(uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         vm.prank(CALLER);
         validator.onInstall(_valData(x, y));
 
@@ -118,7 +121,7 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
 
     /// @notice After uninstall the key is cleared and the account reads as uninitialized.
     function check_Validator_onUninstall_clears(uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         vm.prank(CALLER);
         validator.onInstall(_valData(x, y));
 
@@ -132,7 +135,7 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
 
     /// @notice Per-account key separation: installing for CALLER never populates OTHER's slot.
     function check_Validator_keySeparation(uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         vm.prank(CALLER);
         validator.onInstall(_valData(x, y));
 
@@ -145,12 +148,12 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     // (c) SIGNER LIFECYCLE
     // =============================================================================================
 
-    /// @notice _signerOninstall reverts InvalidPublicKey iff either coordinate is zero; otherwise it
+    /// @notice _signerOninstall reverts InvalidPublicKey iff coordinates are not on P-256; otherwise it
     ///         stores under webAuthnSignerStorage[id][msg.sender] and increments usedIds[msg.sender].
     function check_Signer_onInstall_pubkeyGuardAndStore(bytes32 id, uint256 x, uint256 y) external {
         vm.prank(CALLER);
         (bool ok, bytes memory ret) = address(signer).call(abi.encodeCall(signer.onInstall, (_sigData(id, x, y))));
-        if (x == 0 || y == 0) {
+        if (!P256Validation.isValidPublicKey(x, y)) {
             assert(!ok && _selector(ret) == INVALID_PUBKEY);
         } else {
             assert(ok);
@@ -162,7 +165,7 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
 
     /// @notice Double-install of the same (id) reverts AlreadyInitialized.
     function check_Signer_onInstall_doubleReverts(bytes32 id, uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         vm.prank(CALLER);
         signer.onInstall(_sigData(id, x, y));
 
@@ -182,7 +185,7 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     /// @notice Uninstall clears the (id,account) key and decrements usedIds without underflow:
     ///         install then uninstall returns usedIds to 0 (no wrap to 2**256-1).
     function check_Signer_onUninstall_clearsAndDecrements(bytes32 id, uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         vm.prank(CALLER);
         signer.onInstall(_sigData(id, x, y));
 
@@ -197,7 +200,7 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     /// @notice Per-(id,account) key separation: installing (id, CALLER) never populates (id, OTHER)
     ///         nor a different id for CALLER.
     function check_Signer_keySeparation(bytes32 id, bytes32 id2, uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         vm.assume(id != id2);
         vm.prank(CALLER);
         signer.onInstall(_sigData(id, x, y));
@@ -214,11 +217,10 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     // REACHABILITY / NON-VACUITY WITNESSES
     // =============================================================================================
 
-    /// @notice Witness: the validator install SUCCESS leaf is LIVE (non-zero key stores & inits).
-    function check_Validator_installReachable(uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+    /// @notice Witness: the validator install SUCCESS leaf is LIVE (a valid curve point stores & inits).
+    function check_Validator_installReachable() external {
         vm.prank(CALLER);
-        validator.onInstall(_valData(x, y));
+        validator.onInstall(_valData(VALID_X, VALID_Y));
         // path live => this fires with a counterexample.
         assert(!validator.isInitialized(CALLER));
     }
@@ -226,21 +228,21 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     /// @notice Witness: the validator InvalidPublicKey revert leaf is LIVE. Low-level call so the
     ///         revert does not abort the test; assert the call SUCCEEDED => counterexample proves the
     ///         revert path is actually taken (non-vacuous).
-    function check_Validator_invalidPubkeyReachable(uint256 y) external {
+    function check_Validator_invalidPubkeyReachable() external {
         vm.prank(CALLER);
-        (bool ok, bytes memory ret) = address(validator).call(abi.encodeCall(validator.onInstall, (_valData(0, y))));
+        (bool ok, bytes memory ret) = address(validator).call(abi.encodeCall(validator.onInstall, (_valData(1, 1))));
         // If the revert path is live, ok==false with the InvalidPublicKey selector; asserting the
         // opposite yields a counterexample proving reachability.
         assert(ok || _selector(ret) != INVALID_PUBKEY);
     }
 
     /// @notice Witness: the validator AlreadyInitialized revert leaf is LIVE.
-    function check_Validator_alreadyInitReachable(uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+    function check_Validator_alreadyInitReachable() external {
         vm.prank(CALLER);
-        validator.onInstall(_valData(x, y));
+        validator.onInstall(_valData(VALID_X, VALID_Y));
         vm.prank(CALLER);
-        (bool ok, bytes memory ret) = address(validator).call(abi.encodeCall(validator.onInstall, (_valData(x, y))));
+        (bool ok, bytes memory ret) =
+            address(validator).call(abi.encodeCall(validator.onInstall, (_valData(VALID_X, VALID_Y))));
         assert(ok || _selector(ret) != ALREADY_INIT);
     }
 
@@ -252,10 +254,9 @@ contract WebAuthnKeyLifecycleHalmos is SymTest {
     }
 
     /// @notice Witness: the signer install SUCCESS leaf is LIVE (usedIds becomes 1).
-    function check_Signer_installReachable(bytes32 id, uint256 x, uint256 y) external {
-        vm.assume(x != 0 && y != 0);
+    function check_Signer_installReachable(bytes32 id) external {
         vm.prank(CALLER);
-        signer.onInstall(_sigData(id, x, y));
+        signer.onInstall(_sigData(id, VALID_X, VALID_Y));
         assert(signer.usedIds(CALLER) != 1);
     }
 
