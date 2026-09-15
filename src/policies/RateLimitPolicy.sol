@@ -2,7 +2,7 @@ pragma solidity ^0.8.0;
 
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
 import {PolicyBase} from "src/base/PolicyBase.sol";
-import {SIG_VALIDATION_SUCCESS_UINT} from "src/types/Constants.sol";
+import {SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
 import {packValidationData, ValidAfter, ValidUntil} from "src/types/Types.sol";
 
 enum Status {
@@ -89,17 +89,12 @@ contract RateLimitPolicy is PolicyBase {
         // Decrement the allowed count.
         state.storedCount--;
 
-        // Return validation data: current time and next reset date.
-        return packValidationData(ValidAfter.wrap(currentTime), ValidUntil.wrap(state.resetDate));
+        // The quota is available immediately and remains valid until this window resets.
+        return packValidationData(ValidAfter.wrap(0), ValidUntil.wrap(state.resetDate));
     }
 
-    /// @notice No signature validation is required for this policy.
-    function checkSignaturePolicy(bytes32 id, address, bytes32, bytes calldata)
-        external
-        view
-        override
-        returns (uint256)
-    {
-        return SIG_VALIDATION_SUCCESS_UINT;
+    /// @notice This stateful policy cannot safely enforce its budget on ERC-1271 signatures.
+    function checkSignaturePolicy(bytes32, address, bytes32, bytes calldata) external pure override returns (uint256) {
+        return SIG_VALIDATION_FAILED_UINT;
     }
 }
