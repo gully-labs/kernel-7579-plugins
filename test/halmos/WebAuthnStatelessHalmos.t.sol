@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {SymTest} from "halmos-cheatcodes/SymTest.sol";
 import {WebAuthnValidator, WebAuthnValidatorData} from "src/validators/WebAuthnValidator.sol";
 import {WebAuthnSigner, WebAuthnSignerData} from "src/signers/WebAuthnSigner.sol";
+import {P256Validation} from "src/utils/P256Validation.sol";
 import {P256 as WebAuthnP256} from "solady/utils/P256.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
 
@@ -32,7 +33,7 @@ contract WebAuthnPrimitiveHalmosHarness {
 
 /// @notice Production validator with only the cryptographic/parser boundary replaced by a
 ///         deterministic argument-checking oracle. The real stateless data-length, ABI-decode,
-///         zero-key, and dispatch logic remains inherited byte-for-byte.
+///         public-key, and dispatch logic remains inherited byte-for-byte.
 contract WebAuthnValidatorOracleHarness is WebAuthnValidator {
     bytes32 internal constant ORACLE_ENABLED_SLOT = keccak256("WebAuthnHalmos.oracle.enabled");
     bytes32 internal constant ORACLE_HASH_SLOT = keccak256("WebAuthnHalmos.oracle.hash");
@@ -134,6 +135,8 @@ contract WebAuthnStatelessHalmos is SymTest {
     bytes32 internal constant ORACLE_SIGNATURE_LENGTH_SLOT = keccak256("WebAuthnHalmos.oracle.signatureLength");
     uint256 internal constant P256_N_DIV_2 =
         57896044605178124381348723474703786764998477612067880171211129530534256022184;
+    uint256 internal constant VALID_X = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296;
+    uint256 internal constant VALID_Y = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5;
 
     WebAuthnValidatorOracleHarness internal validator;
     WebAuthnSignerOracleHarness internal signer;
@@ -191,7 +194,7 @@ contract WebAuthnStatelessHalmos is SymTest {
         bool oracleResult,
         address requestingProtocol
     ) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         bytes memory signature = hex"010203";
         _armOracle(hash, x, y, signature.length, oracleResult);
 
@@ -218,7 +221,7 @@ contract WebAuthnStatelessHalmos is SymTest {
     }
 
     function check_StatelessIgnoresInstalledState(bytes32 hash, uint256 x, uint256 y, bool oracleResult) external {
-        vm.assume(x != 0 && y != 0);
+        vm.assume(P256Validation.isValidPublicKey(x, y));
         bytes memory signature = hex"010203";
         _armOracle(hash, x, y, signature.length, oracleResult);
 
@@ -226,9 +229,9 @@ contract WebAuthnStatelessHalmos is SymTest {
         bool signerBefore = signer.validateSignatureWithData(hash, signature, _data(x, y));
 
         vm.prank(CALLER);
-        validator.onInstall(_data(7, 11));
+        validator.onInstall(_data(VALID_X, VALID_Y));
         vm.prank(CALLER);
-        signer.onInstall(_signerInstallData(7, 11));
+        signer.onInstall(_signerInstallData(VALID_X, VALID_Y));
 
         bool validatorAfter = validator.validateSignatureWithData(hash, signature, _data(x, y));
         bool signerAfter = signer.validateSignatureWithData(hash, signature, _data(x, y));
@@ -262,15 +265,15 @@ contract WebAuthnStatelessHalmos is SymTest {
 
     function check_StatelessAcceptReachable(bytes32 hash) external {
         bytes memory signature = hex"010203";
-        _armOracle(hash, 1, 1, signature.length, true);
-        bool result = validator.validateSignatureWithData(hash, signature, _data(1, 1));
+        _armOracle(hash, VALID_X, VALID_Y, signature.length, true);
+        bool result = validator.validateSignatureWithData(hash, signature, _data(VALID_X, VALID_Y));
         assert(!result);
     }
 
     function check_StatelessRejectReachable(bytes32 hash) external {
         bytes memory signature = hex"010203";
-        _armOracle(hash, 1, 1, signature.length, false);
-        bool result = signer.validateSignatureWithData(hash, signature, _data(1, 1));
+        _armOracle(hash, VALID_X, VALID_Y, signature.length, false);
+        bool result = signer.validateSignatureWithData(hash, signature, _data(VALID_X, VALID_Y));
         assert(result);
     }
 }
