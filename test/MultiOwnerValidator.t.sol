@@ -291,22 +291,22 @@ contract MultiOwnerValidatorTest is ValidatorTestBase {
         assertEq(validator.isValidSignatureWithSender(address(0), hash, signature), ERC1271_MAGICVALUE);
     }
 
-    function testDelegatesToWebAuthnStatelessSignerWithDynamicLocations() public {
+    function testDelegatesToWebAuthnStatelessSignerWithLegacyEncoding() public {
         _installDefault();
         vm.prank(WALLET);
         validator.addOwner(_webAuthnConfig(WEBAUTHN_ID));
 
-        bytes32 hash = keccak256("dynamic WebAuthn locations");
-        bytes memory webAuthnSignature = _webAuthnSignature(hash, '{"origin":"https://example.com",');
+        bytes32 hash = keccak256("legacy WebAuthn encoding");
+        bytes memory webAuthnSignature = _webAuthnSignature(hash, "{");
         (
             bytes memory authenticatorData,
             string memory clientDataJSON,
-            uint256 challengeLocation,
             uint256 responseTypeLocation,
             uint256 r,
-            uint256 s
-        ) = abi.decode(webAuthnSignature, (bytes, string, uint256, uint256, uint256, uint256));
-        assertNotEq(challengeLocation, 23);
+            uint256 s,
+            bool usePrecompiled
+        ) = abi.decode(webAuthnSignature, (bytes, string, uint256, uint256, uint256, bool));
+        assertFalse(usePrecompiled);
 
         vm.prank(WALLET);
         assertEq(
@@ -315,7 +315,7 @@ contract MultiOwnerValidatorTest is ValidatorTestBase {
         );
 
         bytes memory wrongLocationSignature =
-            abi.encode(authenticatorData, clientDataJSON, uint256(23), responseTypeLocation, r, s);
+            abi.encode(authenticatorData, clientDataJSON, responseTypeLocation + 1, r, s, usePrecompiled);
         vm.prank(WALLET);
         assertEq(
             validator.isValidSignatureWithSender(
@@ -493,15 +493,11 @@ contract MultiOwnerValidatorTest is ValidatorTestBase {
         string memory clientDataJSON =
             string.concat(clientDataPrefix, '"type":"webauthn.get",', '"challenge":"', challenge, '"}');
         uint256 responseTypeLocation = bytes(clientDataPrefix).length;
-        uint256 challengeLocation = responseTypeLocation + 22;
         bytes32 messageHash = sha256(abi.encodePacked(authenticatorData, sha256(bytes(clientDataJSON))));
         (bytes32 r, bytes32 s) = vm.signP256(P256_KEY, messageHash);
         uint256 normalizedS = uint256(s);
         if (normalizedS > P256_N / 2) normalizedS = P256_N - normalizedS;
 
-        return
-            abi.encode(
-                authenticatorData, clientDataJSON, challengeLocation, responseTypeLocation, uint256(r), normalizedS
-            );
+        return abi.encode(authenticatorData, clientDataJSON, responseTypeLocation, uint256(r), normalizedS, false);
     }
 }
