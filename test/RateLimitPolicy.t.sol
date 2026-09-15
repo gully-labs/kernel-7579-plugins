@@ -4,7 +4,7 @@ import {PolicyTestBase} from "./base/PolicyTestBase.sol";
 import {RateLimitPolicy, Status} from "src/policies/RateLimitPolicy.sol";
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
 import {IModule} from "src/interfaces/IERC7579Modules.sol";
-import {SIG_VALIDATION_SUCCESS_UINT} from "src/types/Constants.sol";
+import {SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
 
 contract RateLimitPolicyTest is PolicyTestBase {
     uint48 constant INTERVAL = 100;
@@ -100,10 +100,16 @@ contract RateLimitPolicyTest is PolicyTestBase {
         vm.stopPrank();
     }
 
-    // checkSignaturePolicy returns SIG_VALIDATION_SUCCESS_UINT unconditionally (see
-    // RateLimitPolicy.checkSignaturePolicy) — there is no signature-shape based failure to
-    // model, so the base "fail" test's premise (a distinguishable invalid signature) does not
-    // apply. Override to assert the real, unconditional-success behavior instead.
+    function testPolicyCheckSignaturePolicySuccess() public payable override {
+        bytes32 id = policyId();
+        vm.startPrank(WALLET);
+        policy.onInstall(abi.encodePacked(id, installData()));
+        uint256 result = policy.checkSignaturePolicy(id, WALLET, keccak256("hash"), "");
+        vm.stopPrank();
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "rate limits cannot authorize ERC-1271 signatures");
+    }
+
     function testPolicyCheckSignaturePolicyFail() public payable override {
         bytes32 id = policyId();
         vm.startPrank(WALLET);
@@ -114,7 +120,7 @@ contract RateLimitPolicyTest is PolicyTestBase {
 
         uint256 result = policy.checkSignaturePolicy(id, sender, testHash, sigData);
         vm.stopPrank();
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "checkSignaturePolicy always succeeds, even for 'invalid' inputs");
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "all ERC-1271 inputs must be rejected");
     }
 
     function test_onInstall_RevertWhen_DataTooShort() public {
@@ -166,8 +172,31 @@ contract RateLimitPolicyTest is PolicyTestBase {
 
         uint48 validAfter = uint48(validationData >> 208);
         uint48 validUntil = uint48(validationData >> 160);
-        assertEq(validAfter, uint48(block.timestamp), "validAfter should be current time");
+        assertEq(validAfter, 0, "validAfter should make quota available immediately");
         assertEq(validUntil, uint48(expectedResetDate), "validUntil should be resetDate");
+    }
+
+    function testFuzz_checkUserOpPolicy_IsImmediatelyValidForTheWholeWindow(
+        uint48 rawTimestamp,
+        uint48 rawInterval,
+        uint48 rawInitialCount
+    ) public {
+        uint48 interval = uint48(bound(rawInterval, 1, type(uint48).max - 1));
+        uint48 timestamp = uint48(bound(rawTimestamp, 1, type(uint48).max - interval));
+        uint48 initialCount = uint48(bound(rawInitialCount, 1, type(uint48).max));
+        vm.warp(timestamp);
+
+        bytes32 id = keccak256(abi.encode("fuzzed rate limit", timestamp, interval, initialCount));
+        vm.startPrank(WALLET);
+        policy.onInstall(abi.encodePacked(id, bytes6(interval), bytes6(initialCount)));
+        uint256 validationData = policy.checkUserOpPolicy(id, _dummyUserOp());
+        vm.stopPrank();
+
+        assertEq(uint48(validationData >> 208), 0, "validAfter must never be the current timestamp");
+        assertEq(uint48(validationData >> 160), timestamp + interval, "validUntil must end at resetDate");
+        (uint48 remaining, uint48 resetDate) = policy.rateLimitState(id, WALLET);
+        assertEq(remaining, initialCount - 1);
+        assertEq(resetDate, timestamp + interval);
     }
 
     function test_checkUserOpPolicy_RevertWhen_BudgetExhausted() public {
@@ -211,7 +240,7 @@ contract RateLimitPolicyTest is PolicyTestBase {
 
         uint48 validAfter = uint48(validationData >> 208);
         uint48 validUntil = uint48(validationData >> 160);
-        assertEq(validAfter, uint48(block.timestamp), "validAfter should be new current time");
+        assertEq(validAfter, 0, "validAfter should remain immediately valid after refill");
         assertEq(validUntil, resetDate, "validUntil should be new resetDate");
     }
 
@@ -230,19 +259,27 @@ contract RateLimitPolicyTest is PolicyTestBase {
         vm.stopPrank();
     }
 
-    function test_checkSignaturePolicy_AlwaysReturnsSuccess() public {
+    function test_checkSignaturePolicy_AlwaysReturnsFailure() public {
         bytes32 id = policyId();
         vm.prank(WALLET);
         policy.onInstall(abi.encodePacked(id, installData()));
 
         uint256 result = policy.checkSignaturePolicy(id, WALLET, keccak256("hash"), "");
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "checkSignaturePolicy should always succeed");
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "rate policy must reject ERC-1271 validation");
     }
 
-    function test_checkSignaturePolicy_ReturnsSuccessEvenWithoutInstall() public {
-        // checkSignaturePolicy is unconditional and does not check status.
+    function test_checkSignaturePolicy_ReturnsFailureEvenWithoutInstall() public {
         uint256 result = policy.checkSignaturePolicy(policyId(), WALLET, keccak256("hash"), "");
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "checkSignaturePolicy should succeed regardless of status");
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "checkSignaturePolicy should reject regardless of status");
+    }
+
+    function testFuzz_checkSignaturePolicy_RejectsEveryERC1271Input(
+        bytes32 id,
+        address sender,
+        bytes32 hash,
+        bytes calldata signature
+    ) public view {
+        assertEq(policy.checkSignaturePolicy(id, sender, hash, signature), SIG_VALIDATION_FAILED_UINT);
     }
 
     function test_onInstall_RevertWhen_AlreadyLive() public {
