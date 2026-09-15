@@ -23,11 +23,11 @@ contract TimelockCancelAuthHalmos is SymTest, Test {
         vm.etch(address(policy), type(TimelockPolicy).runtimeCode);
     }
 
-    // proposals slot = 2. base = keccak(account, keccak(id, keccak(userOpKey, 2))).
+    // proposals slot = 3. base = keccak(account, keccak(id, keccak(userOpKey, 3))).
     // Proposal packs {status(uint8), validAfter(uint48), validUntil(uint48)} into base slot;
     // epoch(uint256) into base+1. Writing base = 1 => status = Pending, rest zero.
     function _seedPending(bytes32 userOpKey, bytes32 id, address account) internal {
-        bytes32 s1 = keccak256(abi.encode(userOpKey, uint256(2)));
+        bytes32 s1 = keccak256(abi.encode(userOpKey, uint256(3)));
         bytes32 s2 = keccak256(abi.encode(id, s1));
         bytes32 base = keccak256(abi.encode(account, s2));
         vm.store(address(policy), base, bytes32(uint256(1))); // ProposalStatus.Pending == 1
