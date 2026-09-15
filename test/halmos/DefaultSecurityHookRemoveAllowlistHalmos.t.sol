@@ -114,7 +114,7 @@ contract DefaultSecurityHookRemoveAllowlistHalmos is SymTest {
     }
 
     /// @dev preCheck msgData for CALLTYPE_SINGLE (mode high byte 0x00), packed executionData =
-    ///      target(20) || value(32) || selector(4); param = dummySelector || abi.encode(mode, ed).
+    ///      target(20) || value(32) || selector(4); param is canonical execute calldata.
     function _buildSingleMsgData(address target, uint256 value, bytes4 selector)
         internal
         view
@@ -122,7 +122,7 @@ contract DefaultSecurityHookRemoveAllowlistHalmos is SymTest {
     {
         bytes32 mode = bytes32(0); // CALLTYPE_SINGLE
         bytes memory executionData = abi.encodePacked(target, value, selector);
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
     }
 
