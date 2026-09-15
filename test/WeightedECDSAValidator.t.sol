@@ -78,12 +78,12 @@ contract WeightedECDSAValidatorTest is Test {
     }
 
     /// @dev The final userOp hash the LAST signature must sign. ep0.7 = eth-signed; ep0.9 = raw.
-    function _finalHash(bytes32 userOpHash) internal view virtual returns (bytes32) {
+    function _baseFinalHash(bytes32 userOpHash) internal view virtual returns (bytes32) {
         return ECDSA.toEthSignedMessageHash(userOpHash);
     }
 
     /// @dev The "wrong" convention (must fail): opposite of _finalHash.
-    function _wrongFinalHash(bytes32 userOpHash) internal view virtual returns (bytes32) {
+    function _wrongBaseFinalHash(bytes32 userOpHash) internal view virtual returns (bytes32) {
         return userOpHash;
     }
 
@@ -117,8 +117,19 @@ contract WeightedECDSAValidatorTest is Test {
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256(bytes(domainName)),
-                keccak256("0.0.4"),
+                keccak256("0.0.5"),
                 block.chainid,
+                address(validator)
+            )
+        );
+    }
+
+    function _chainAgnosticDomainSeparator() internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,address verifyingContract)"),
+                keccak256(bytes(domainName)),
+                keccak256("0.0.5"),
                 address(validator)
             )
         );
@@ -131,15 +142,77 @@ contract WeightedECDSAValidatorTest is Test {
                 _domainSeparator(),
                 keccak256(
                     abi.encode(
-                        keccak256("Proposal(address account,bytes32 id,bytes callData,uint256 nonce)"),
+                        keccak256(
+                            "Proposal(address account,bytes32 id,bytes callData,uint256 nonce,uint256 configurationEpoch)"
+                        ),
                         userOp.sender,
                         bytes32(0),
                         keccak256(userOp.callData),
-                        userOp.nonce
+                        userOp.nonce,
+                        validator.configurationEpoch(WALLET)
                     )
                 )
             )
         );
+    }
+
+    function _finalHash(bytes32 userOpHash) internal view returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                _domainSeparator(),
+                keccak256(
+                    abi.encode(
+                        keccak256("WeightedUserOperation(bytes32 userOpHash,uint256 configurationEpoch)"),
+                        _baseFinalHash(userOpHash),
+                        validator.configurationEpoch(WALLET)
+                    )
+                )
+            )
+        );
+    }
+
+    function _wrongFinalHash(bytes32 userOpHash) internal view returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                _domainSeparator(),
+                keccak256(
+                    abi.encode(
+                        keccak256("WeightedUserOperation(bytes32 userOpHash,uint256 configurationEpoch)"),
+                        _wrongBaseFinalHash(userOpHash),
+                        validator.configurationEpoch(WALLET)
+                    )
+                )
+            )
+        );
+    }
+
+    function _replayProposalHash(PackedUserOperation memory userOp) internal view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    "Proposal(address account,bytes32 id,bytes callData,uint256 nonce,uint256 configurationEpoch)"
+                ),
+                userOp.sender,
+                bytes32(0),
+                keccak256(userOp.callData),
+                userOp.nonce,
+                validator.configurationEpoch(WALLET)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", _chainAgnosticDomainSeparator(), structHash));
+    }
+
+    function _replayFinalHash(bytes32 userOpHash) internal view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("WeightedUserOperation(bytes32 userOpHash,uint256 configurationEpoch)"),
+                _baseFinalHash(userOpHash),
+                validator.configurationEpoch(WALLET)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", _chainAgnosticDomainSeparator(), structHash));
     }
 
     function _sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
@@ -529,6 +602,121 @@ contract WeightedECDSAValidatorTest is Test {
         assertEq(validator.validateUserOp(userOp, userOpHash), SIG_VALIDATION_FAILED_UINT, "empty sig");
     }
 
+    function test_validateUserOp_ReplayableSignatureSurvivesChainChange() public {
+        _install();
+        PackedUserOperation memory userOp = _userOp(hex"aabb", (uint256(0x40) << 248) | 1);
+        bytes32 chainAgnosticUserOpHash = keccak256("chain-agnostic-user-op");
+        userOp.signature = abi.encodePacked(
+            _sign(guardianKeys[0], _replayProposalHash(userOp)),
+            _sign(guardianKeys[1], _replayFinalHash(chainAgnosticUserOpHash))
+        );
+
+        vm.chainId(block.chainid + 1);
+        vm.prank(WALLET);
+        assertEq(
+            validator.validateUserOp(userOp, chainAgnosticUserOpHash),
+            SIG_VALIDATION_SUCCESS_UINT,
+            "replayable signature must use the chain-agnostic domain"
+        );
+    }
+
+    function testFuzz_validateUserOp_ReplayableAndChainBoundDomainsRemainSeparated(
+        uint64 rawSourceChainId,
+        uint64 rawDestinationChainId,
+        uint64 lowNonce,
+        bytes32 callDataSalt,
+        bytes32 userOpHash
+    ) public {
+        uint256 sourceChainId = uint256(rawSourceChainId);
+        uint256 destinationChainId = uint256(rawDestinationChainId);
+        if (destinationChainId == sourceChainId) {
+            destinationChainId = sourceChainId == type(uint64).max ? 0 : sourceChainId + 1;
+        }
+        vm.chainId(sourceChainId);
+        _install();
+
+        PackedUserOperation memory replayableOp =
+            _userOp(abi.encodePacked(callDataSalt), (uint256(0x40) << 248) | lowNonce);
+        replayableOp.signature = abi.encodePacked(
+            _sign(guardianKeys[0], _replayProposalHash(replayableOp)),
+            _sign(guardianKeys[1], _replayFinalHash(userOpHash))
+        );
+
+        PackedUserOperation memory chainBoundOp = _userOp(abi.encodePacked(callDataSalt), uint256(lowNonce));
+        chainBoundOp.signature = abi.encodePacked(
+            _sign(guardianKeys[0], _proposalHash(chainBoundOp)), _sign(guardianKeys[1], _finalHash(userOpHash))
+        );
+
+        vm.chainId(destinationChainId);
+        vm.prank(WALLET);
+        assertEq(
+            validator.validateUserOp(replayableOp, userOpHash),
+            SIG_VALIDATION_SUCCESS_UINT,
+            "replayable approval changed across chains"
+        );
+
+        vm.prank(WALLET);
+        (bool success, bytes memory result) =
+            address(validator).call(abi.encodeCall(validator.validateUserOp, (chainBoundOp, userOpHash)));
+        assertTrue(
+            !success || abi.decode(result, (uint256)) != SIG_VALIDATION_SUCCESS_UINT,
+            "chain-bound approval crossed chains"
+        );
+    }
+
+    function test_validateUserOp_OldApprovalFailsAfterReinstall() public {
+        _install();
+        PackedUserOperation memory userOp = _userOp(hex"aabb", 1);
+        bytes32 userOpHash = keccak256("user-op");
+        userOp.signature = abi.encodePacked(
+            _sign(guardianKeys[0], _proposalHash(userOp)), _sign(guardianKeys[1], _finalHash(userOpHash))
+        );
+        assertEq(validator.configurationEpoch(WALLET), 1);
+
+        vm.startPrank(WALLET);
+        validator.onUninstall("");
+        validator.onInstall(_installData());
+        vm.stopPrank();
+        assertEq(validator.configurationEpoch(WALLET), 2);
+
+        vm.prank(WALLET);
+        (bool success, bytes memory result) =
+            address(validator).call(abi.encodeCall(validator.validateUserOp, (userOp, userOpHash)));
+        assertTrue(
+            !success || abi.decode(result, (uint256)) != SIG_VALIDATION_SUCCESS_UINT,
+            "old approval must not survive configuration change"
+        );
+    }
+
+    function testFuzz_validateUserOp_OldApprovalFailsAfterEveryReinstallCycle(
+        uint8 rawCycles,
+        bytes32 callDataSalt,
+        bytes32 userOpHash
+    ) public {
+        _install();
+        PackedUserOperation memory userOp = _userOp(abi.encodePacked(callDataSalt), 1);
+        userOp.signature = abi.encodePacked(
+            _sign(guardianKeys[0], _proposalHash(userOp)), _sign(guardianKeys[1], _finalHash(userOpHash))
+        );
+
+        uint256 cycles = bound(uint256(rawCycles), 1, 8);
+        vm.startPrank(WALLET);
+        for (uint256 i; i < cycles; ++i) {
+            validator.onUninstall("");
+            validator.onInstall(_installData());
+        }
+        vm.stopPrank();
+        assertEq(validator.configurationEpoch(WALLET), cycles + 1);
+
+        vm.prank(WALLET);
+        (bool success, bytes memory result) =
+            address(validator).call(abi.encodeCall(validator.validateUserOp, (userOp, userOpHash)));
+        assertTrue(
+            !success || abi.decode(result, (uint256)) != SIG_VALIDATION_SUCCESS_UINT,
+            "old approval survived a later epoch"
+        );
+    }
+
     // ============ isValidSignatureWithSender (ERC-1271, ep-agnostic) ============
 
     function test_isValidSignatureWithSender_ReturnsInvalid_WhenNotInstalled() public {
@@ -698,11 +886,11 @@ contract WeightedECDSAValidatorV09Test is WeightedECDSAValidatorTest {
         return new WeightedECDSAValidatorV09();
     }
 
-    function _finalHash(bytes32 userOpHash) internal pure override returns (bytes32) {
+    function _baseFinalHash(bytes32 userOpHash) internal pure override returns (bytes32) {
         return userOpHash; // ep0.9: raw userOpHash
     }
 
-    function _wrongFinalHash(bytes32 userOpHash) internal pure override returns (bytes32) {
+    function _wrongBaseFinalHash(bytes32 userOpHash) internal pure override returns (bytes32) {
         return ECDSA.toEthSignedMessageHash(userOpHash);
     }
 }
