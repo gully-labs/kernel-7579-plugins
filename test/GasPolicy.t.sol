@@ -36,6 +36,14 @@ contract GasPolicyTest is PolicyTestBase {
         return abi.encode(allowed, enforcePaymaster, allowedPaymaster);
     }
 
+    function _paymasterAndData(address paymasterAddress, uint128 verificationGas, uint128 postOpGas)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(paymasterAddress, verificationGas, postOpGas);
+    }
+
     function _userOp(uint128 gasLimit, uint128 fee, bytes memory paymasterAndData)
         internal
         pure
@@ -90,15 +98,24 @@ contract GasPolicyTest is PolicyTestBase {
         return (WALLET, "");
     }
 
-    // GasPolicy's checkSignaturePolicy ignores sender/hash/sig entirely -- it only gates on
-    // policy status. The generic base "fail" test assumes sig data content can flip the result,
-    // which is impossible here, so we cover the real failure mode (not-Live) directly instead.
+    function testPolicyCheckSignaturePolicySuccess() public payable override {
+        GasPolicy policy = GasPolicy(address(module));
+        vm.startPrank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), installData()));
+        uint256 result = policy.checkSignaturePolicy(policyId(), WALLET, keccak256("hash"), "");
+        vm.stopPrank();
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "gas budgets cannot authorize ERC-1271 signatures");
+    }
+
     function testPolicyCheckSignaturePolicyFail() public payable override {
         GasPolicy policy = GasPolicy(address(module));
-        // never installed -> status is NA, not Live
-        vm.prank(WALLET);
-        vm.expectRevert();
-        policy.checkSignaturePolicy(policyId(), WALLET, keccak256("hash"), "");
+        vm.startPrank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), installData()));
+        uint256 result = policy.checkSignaturePolicy(policyId(), address(0), bytes32(0), hex"deadbeef");
+        vm.stopPrank();
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "all ERC-1271 inputs must be rejected");
     }
 
     function _afterInstallCheck(bytes32 id) internal view override {
@@ -283,7 +300,7 @@ contract GasPolicyTest is PolicyTestBase {
         vm.prank(WALLET);
         policy.onInstall(abi.encodePacked(policyId(), _installDataWithPaymaster(ALLOWED, true, paymaster)));
 
-        bytes memory paymasterAndData = abi.encodePacked(paymaster, uint256(0), uint256(0));
+        bytes memory paymasterAndData = _paymasterAndData(paymaster, 0, 0);
         PackedUserOperation memory userOp = _userOp(VALID_GAS_LIMIT, VALID_FEE, paymasterAndData);
 
         vm.prank(WALLET);
@@ -297,7 +314,7 @@ contract GasPolicyTest is PolicyTestBase {
         vm.prank(WALLET);
         policy.onInstall(abi.encodePacked(policyId(), _installDataWithPaymaster(ALLOWED, true, paymaster)));
 
-        bytes memory paymasterAndData = abi.encodePacked(otherPaymaster, uint256(0), uint256(0));
+        bytes memory paymasterAndData = _paymasterAndData(otherPaymaster, 0, 0);
         PackedUserOperation memory userOp = _userOp(VALID_GAS_LIMIT, VALID_FEE, paymasterAndData);
 
         vm.prank(WALLET);
@@ -309,20 +326,31 @@ contract GasPolicyTest is PolicyTestBase {
         assertEq(remaining, ALLOWED, "allowed should not be decremented on paymaster mismatch");
     }
 
-    function test_checkUserOpPolicy_WhenPaymasterEnforcedButAllowedPaymasterIsZero_ShouldSkipCheckAndPass() public {
-        // enforcePaymaster = true but allowedPaymaster == address(0) => the address(0) branch
-        // short-circuits the paymaster comparison entirely, regardless of who the actual paymaster is.
+    function test_checkUserOpPolicy_WhenPaymasterEnforcedAndAllowedPaymasterIsZero_AllowsAnyPaymaster() public {
         GasPolicy policy = GasPolicy(address(module));
         vm.prank(WALLET);
         policy.onInstall(abi.encodePacked(policyId(), _installDataWithPaymaster(ALLOWED, true, address(0))));
 
-        bytes memory paymasterAndData = abi.encodePacked(otherPaymaster, uint256(0), uint256(0));
+        bytes memory paymasterAndData = _paymasterAndData(otherPaymaster, 0, 0);
         PackedUserOperation memory userOp = _userOp(VALID_GAS_LIMIT, VALID_FEE, paymasterAndData);
 
         vm.prank(WALLET);
         uint256 result = policy.checkUserOpPolicy(policyId(), userOp);
 
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "zero allowedPaymaster should skip paymaster check");
+        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "zero allowedPaymaster should allow any supplied paymaster");
+    }
+
+    function test_checkUserOpPolicy_WhenAnyPaymasterRequiredAndDataIsEmpty_ShouldFail() public {
+        GasPolicy policy = GasPolicy(address(module));
+        vm.prank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), _installDataWithPaymaster(ALLOWED, true, address(0))));
+
+        vm.prank(WALLET);
+        uint256 result = policy.checkUserOpPolicy(policyId(), validUserOp());
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "enforcePaymaster must require a nonempty paymaster");
+        (uint128 remaining,,) = policy.gasPolicyConfig(policyId(), WALLET);
+        assertEq(remaining, ALLOWED, "failed sponsorship check must preserve the budget");
     }
 
     function test_checkUserOpPolicy_WhenNotEnforcingPaymaster_ShouldIgnorePaymasterAndDataField() public {
@@ -371,6 +399,76 @@ contract GasPolicyTest is PolicyTestBase {
         assertEq(result, SIG_VALIDATION_FAILED_UINT, "short paymasterAndData should fail cleanly, not revert");
     }
 
+    function test_checkUserOpPolicy_MalformedPaymasterStaticFieldsFailWithoutReverting() public {
+        GasPolicy policy = GasPolicy(address(module));
+        vm.prank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), installData()));
+
+        bytes memory truncatedStaticFields = new bytes(51);
+        PackedUserOperation memory userOp = _userOp(VALID_GAS_LIMIT, VALID_FEE, truncatedStaticFields);
+
+        vm.prank(WALLET);
+        uint256 result = policy.checkUserOpPolicy(policyId(), userOp);
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "v0.9 paymaster static fields require at least 52 bytes");
+        (uint128 remaining,,) = policy.gasPolicyConfig(policyId(), WALLET);
+        assertEq(remaining, ALLOWED, "malformed paymaster data must preserve the budget");
+    }
+
+    function test_checkUserOpPolicy_IncludesBothPaymasterGasLimitsInBudget() public {
+        GasPolicy policy = GasPolicy(address(module));
+        uint128 paymasterVerificationGas = 300;
+        uint128 paymasterPostOpGas = 400;
+        uint128 exactBudget = 2 * VALID_GAS_LIMIT + paymasterVerificationGas + paymasterPostOpGas;
+        vm.prank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), _installDataWithPaymaster(exactBudget, false, address(0))));
+
+        PackedUserOperation memory userOp = _userOp(
+            VALID_GAS_LIMIT, VALID_FEE, _paymasterAndData(paymaster, paymasterVerificationGas, paymasterPostOpGas)
+        );
+
+        vm.prank(WALLET);
+        uint256 result = policy.checkUserOpPolicy(policyId(), userOp);
+
+        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "the exact five-field gas budget should pass");
+        (uint128 remaining,,) = policy.gasPolicyConfig(policyId(), WALLET);
+        assertEq(remaining, 0, "both paymaster gas limits must be charged");
+    }
+
+    function testFuzz_checkUserOpPolicy_ChargesEveryGasFieldAndAcceptsAnyRealPaymaster(
+        address sponsor,
+        uint64 preVerificationGas,
+        uint64 verificationGasLimit,
+        uint64 callGasLimit,
+        uint64 paymasterVerificationGas,
+        uint64 paymasterPostOpGas,
+        uint32 maxFeePerGas
+    ) public {
+        vm.assume(sponsor != address(0));
+
+        uint256 totalGas = uint256(preVerificationGas) + verificationGasLimit + callGasLimit + paymasterVerificationGas
+            + paymasterPostOpGas;
+        uint128 exactBudget = uint128(totalGas * maxFeePerGas);
+        GasPolicy policy = GasPolicy(address(module));
+
+        vm.prank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), _installDataWithPaymaster(exactBudget, true, address(0))));
+
+        PackedUserOperation memory userOp = _userOpRaw(
+            verificationGasLimit,
+            callGasLimit,
+            preVerificationGas,
+            maxFeePerGas,
+            _paymasterAndData(sponsor, paymasterVerificationGas, paymasterPostOpGas)
+        );
+        vm.prank(WALLET);
+        uint256 result = policy.checkUserOpPolicy(policyId(), userOp);
+
+        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "an exact five-field budget must pass");
+        (uint128 remaining,,) = policy.gasPolicyConfig(policyId(), WALLET);
+        assertEq(remaining, 0, "the full gas budget must be consumed exactly");
+    }
+
     /// @notice True uint256 cost is exactly 2^128 (>= budget of 1e18) but its
     /// low-128-bit residue is 0. A `uint128(allowed) >= uint128(maxAmount)`-style
     /// truncated comparison would let a residue of 0 slip under any nonzero budget. Comparing
@@ -415,7 +513,7 @@ contract GasPolicyTest is PolicyTestBase {
         policy.checkSignaturePolicy(policyId(), WALLET, keccak256("hash"), "");
     }
 
-    function test_checkSignaturePolicy_WhenLive_ShouldReturnSuccess() public {
+    function test_checkSignaturePolicy_WhenLive_ShouldReturnFailure() public {
         GasPolicy policy = GasPolicy(address(module));
         vm.prank(WALLET);
         policy.onInstall(abi.encodePacked(policyId(), installData()));
@@ -423,6 +521,23 @@ contract GasPolicyTest is PolicyTestBase {
         vm.prank(WALLET);
         uint256 result = policy.checkSignaturePolicy(policyId(), WALLET, keccak256("hash"), "");
 
-        assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "should succeed when Live");
+        assertEq(result, SIG_VALIDATION_FAILED_UINT, "gas policy must reject ERC-1271 validation");
+    }
+
+    function testFuzz_checkSignaturePolicy_RejectsEveryERC1271Input(
+        address sender,
+        bytes32 hash,
+        bytes calldata signature
+    ) public {
+        GasPolicy policy = GasPolicy(address(module));
+        vm.prank(WALLET);
+        policy.onInstall(abi.encodePacked(policyId(), installData()));
+
+        vm.prank(WALLET);
+        uint256 result = policy.checkSignaturePolicy(policyId(), sender, hash, signature);
+
+        assertEq(result, SIG_VALIDATION_FAILED_UINT);
+        (uint128 remaining,,) = policy.gasPolicyConfig(policyId(), WALLET);
+        assertEq(remaining, ALLOWED, "ERC-1271 rejection must not consume the UserOp budget");
     }
 }
