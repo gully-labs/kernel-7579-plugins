@@ -1,6 +1,7 @@
 pragma solidity ^0.8.0;
 
 import {PackedUserOperation} from "account-abstraction/interfaces/PackedUserOperation.sol";
+import {UserOperationLib} from "account-abstraction/core/UserOperationLib.sol";
 import {PolicyBase} from "src/base/PolicyBase.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "src/types/Constants.sol";
 
@@ -35,24 +36,40 @@ contract GasPolicy is PolicyBase {
         returns (uint256)
     {
         require(status[id][msg.sender] == Status.Live, PolicyNotLive());
-        (uint256 verificationGasLimit, uint256 callGasLimit) =
-            (uint128(bytes16(userOp.accountGasLimits)), uint128(uint256(userOp.accountGasLimits)));
-        uint256 maxFeePerGas = uint128(uint256(userOp.gasFees));
-        uint256 maxAmount = (userOp.preVerificationGas + verificationGasLimit + callGasLimit) * maxFeePerGas;
-        if (gasPolicyConfig[id][msg.sender].enforcePaymaster) {
-            address allowedPaymaster = gasPolicyConfig[id][msg.sender].allowedPaymaster;
-            if (
-                allowedPaymaster != address(0)
-                    && (userOp.paymasterAndData.length < 20
-                        || address(bytes20(userOp.paymasterAndData[0:20])) != allowedPaymaster)
-            ) {
+        uint256 paymasterVerificationGasLimit;
+        uint256 paymasterPostOpGasLimit;
+        address paymaster;
+
+        bytes calldata paymasterAndData = userOp.paymasterAndData;
+        if (paymasterAndData.length != 0) {
+            if (paymasterAndData.length < UserOperationLib.PAYMASTER_DATA_OFFSET) {
+                return SIG_VALIDATION_FAILED_UINT;
+            }
+            (paymaster, paymasterVerificationGasLimit, paymasterPostOpGasLimit) =
+                UserOperationLib.unpackPaymasterStaticFields(paymasterAndData);
+            if (paymaster == address(0)) return SIG_VALIDATION_FAILED_UINT;
+        }
+
+        GasPolicyConfig storage config = gasPolicyConfig[id][msg.sender];
+        if (config.enforcePaymaster) {
+            if (paymaster == address(0)) return SIG_VALIDATION_FAILED_UINT;
+            if (config.allowedPaymaster != address(0) && paymaster != config.allowedPaymaster) {
                 return SIG_VALIDATION_FAILED_UINT;
             }
         }
-        if (maxAmount > gasPolicyConfig[id][msg.sender].allowed) {
+
+        (uint256 verificationGasLimit, uint256 callGasLimit) = UserOperationLib.unpackUints(userOp.accountGasLimits);
+        uint256 maxFeePerGas = UserOperationLib.unpackMaxFeePerGas(userOp);
+        uint256 maxAmount =
+            (userOp.preVerificationGas
+                    + verificationGasLimit
+                    + callGasLimit
+                    + paymasterVerificationGasLimit
+                    + paymasterPostOpGasLimit) * maxFeePerGas;
+        if (maxAmount > config.allowed) {
             return SIG_VALIDATION_FAILED_UINT;
         }
-        gasPolicyConfig[id][msg.sender].allowed = uint128(gasPolicyConfig[id][msg.sender].allowed - maxAmount);
+        config.allowed = uint128(config.allowed - maxAmount);
         return SIG_VALIDATION_SUCCESS_UINT;
     }
 
@@ -63,7 +80,7 @@ contract GasPolicy is PolicyBase {
         returns (uint256)
     {
         require(status[id][msg.sender] == Status.Live, PolicyNotLive());
-        return SIG_VALIDATION_SUCCESS_UINT;
+        return SIG_VALIDATION_FAILED_UINT;
     }
 
     function _policyOninstall(bytes32 id, bytes calldata _data) internal override {
