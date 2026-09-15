@@ -41,12 +41,11 @@ contract TimelockInitFlagHalmos is SymTest, Test {
         return init;
     }
 
-    // Precondition: keep the uint48 overflow guard (L108) satisfiable so onInstall can succeed.
-    function _validParams(uint48 delay, uint48 expirationPeriod) internal view {
+    // Precondition: keep the configuration sum inside uint48 so onInstall can succeed.
+    function _validParams(uint48 delay, uint48 expirationPeriod) internal pure {
         vm.assume(delay > 0);
         vm.assume(expirationPeriod > 0);
-        vm.assume(block.timestamp <= type(uint48).max);
-        vm.assume(uint256(delay) + uint256(expirationPeriod) <= uint256(type(uint48).max) - block.timestamp);
+        vm.assume(uint256(delay) + uint256(expirationPeriod) <= uint256(type(uint48).max));
     }
 
     /// @notice ROUND-TRIP IDEMPOTENCE (^req-20/^req-21): starting from an uninitialized (id, account),
