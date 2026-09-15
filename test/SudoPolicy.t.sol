@@ -102,6 +102,7 @@ contract SudoPolicyTest is PolicyTestBase {
         IPolicy policyModule = IPolicy(address(module));
         PackedUserOperation memory userOp = validUserOp();
 
+        vm.prank(WALLET);
         uint256 result = policyModule.checkUserOpPolicy(policyId(), userOp);
         assertEq(result, SIG_VALIDATION_SUCCESS_UINT, "SudoPolicy should approve even without install");
     }
