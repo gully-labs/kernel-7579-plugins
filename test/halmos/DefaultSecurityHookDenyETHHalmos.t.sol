@@ -63,10 +63,7 @@ contract DefaultSecurityHookDenyETHHalmos is SymTest {
         bytes32 mode = bytes32(0); // high byte == 0x00 => CALLTYPE_SINGLE
         bytes4 selector = svm.createBytes4("selector");
         bytes memory executionData = abi.encodePacked(target, value, selector);
-        // preCheck reads the inner `msgData` param as: [0:4] dummy selector, [4:36] mode,
-        // [36:68] ABI offset for the executionData bytes, then length + data. So the param must be
-        // dummy-selector || abi.encode(mode, executionData) (proper ABI framing for the inner bytes).
-        bytes memory param = abi.encodePacked(bytes4(0), abi.encode(mode, executionData));
+        bytes memory param = abi.encodeWithSelector(bytes4(0xe9ae5c53), mode, executionData);
         msgData = abi.encodeWithSelector(hook.preCheck.selector, address(0), uint256(0), param);
     }
 
@@ -214,7 +211,7 @@ contract DefaultSecurityHookDenyETHHalmos is SymTest {
     ///         (allowlist-first branch :188 returns before the ETH check). Asserts false on the
     ///         non-revert leaf so a counterexample witnesses that the gate discriminates on allowlist
     ///         state.
-    function check_DenyETH_converseLive() external {
+    function check_DenyETH_converseLive_reachable() external {
         _makeTargetNotModule();
 
         vm.prank(ACCOUNT);
