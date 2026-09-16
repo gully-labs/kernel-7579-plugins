@@ -18,6 +18,9 @@ lcov.info
 lcov*.info
 log/
 
+# macOS metadata
+.DS_Store
+
 # Local verification output
 .certora_internal/
 coverage_*.log
