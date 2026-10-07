@@ -17,9 +17,10 @@ interface Vm {
 
 /// @author taek <leekt216@gmail.com>
 /// @notice Halmos proof harness for CallerPolicy access semantics (TF-CallerPolicy).
-/// @dev Storage-layout facts (CallerPolicy declares two mappings, no other state):
+/// @dev Storage-layout facts (CallerPolicy declares three mappings, no other state):
 ///        slot 0: mapping(bytes32 id => mapping(address account => Status)) status
 ///        slot 1: mapping(bytes32 id => mapping(address caller => mapping(address wallet => bool))) allowedCaller
+///        slot 2: mapping(bytes32 id => mapping(address wallet => address[])) _callers
 ///      We write SYMBOLIC values into these slots (via keccak-derived keys that mirror Solidity's
 ///      layout) so status can be any of NA/Live/Deprecated and allowedCaller any bool — otherwise the
 ///      etched (all-zero) storage would fix status==NA and the Live branches would be vacuous.
@@ -167,6 +168,43 @@ contract CallerPolicyHalmos is SymTest {
         vm.prank(account);
         uint256 ret = policy.checkUserOpPolicy(id, op);
         assert(ret != SIG_VALIDATION_FAILED_UINT); // counterexample => not-Live rejection path reachable
+    }
+
+    /// @notice Reinstall replaces the allowlist, including duplicate or reused callers (two old, one new).
+    function check_CallerPolicy_reinstallReplacesCallers(
+        bytes32 id,
+        address wallet,
+        address oldCaller1,
+        address oldCaller2,
+        address newCaller
+    ) external {
+        vm.assume(oldCaller1 != address(0) && oldCaller2 != address(0) && newCaller != address(0));
+        address[] memory callers = new address[](2);
+        callers[0] = oldCaller1;
+        callers[1] = oldCaller2;
+        vm.prank(wallet);
+        policy.onInstall(abi.encodePacked(id, abi.encode(callers)));
+
+        vm.prank(wallet);
+        policy.onUninstall(abi.encodePacked(id));
+        assert(policy.status(id, wallet) == Status.Deprecated);
+        assert(!policy.allowedCaller(id, oldCaller1, wallet));
+        assert(!policy.allowedCaller(id, oldCaller2, wallet));
+
+        address[] memory newCallers = new address[](1);
+        newCallers[0] = newCaller;
+        vm.prank(wallet);
+        policy.onInstall(abi.encodePacked(id, abi.encode(newCallers)));
+
+        assert(policy.status(id, wallet) == Status.Live);
+        assert(policy.allowedCaller(id, oldCaller1, wallet) == (oldCaller1 == newCaller));
+        assert(policy.allowedCaller(id, oldCaller2, wallet) == (oldCaller2 == newCaller));
+        vm.prank(wallet);
+        assert(policy.checkSignaturePolicy(id, newCaller, bytes32(0), hex"") == SIG_VALIDATION_SUCCESS_UINT);
+
+        vm.prank(wallet);
+        policy.onUninstall(abi.encodePacked(id));
+        assert(!policy.allowedCaller(id, newCaller, wallet));
     }
 
     // ============================================================================================
